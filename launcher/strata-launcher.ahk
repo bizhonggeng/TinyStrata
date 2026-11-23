@@ -1119,45 +1119,13 @@ PackProblem(o) {                           ; "" = 没问题；否则是要拦下
         return ""                         ; 完全没指定 GGUF 由另一条提醒负责
     pack := EffectivePack()
     if (pack = "")
-        return "没有可用的 pack：GGUF「" . BaseName(native) . "」要先做一个 pack（约 3 秒 / 65 MB，菜单「关于 → 准备 pack」或 make_pack.py）"
+        return "这个 GGUF 还没有 pack：启动时由服务端自动生成（约 3 秒 / 65 MB）"
     if !DirExist(pack)
         return "pack 目录不存在: " . pack
     named := PackHeaderGguf(pack)
     if (named != "" && StrLower(named) != StrLower(BaseName(native)))
-        return "pack 与模型不匹配：pack 指向「" . named . "」，当前 GGUF 是「" . BaseName(native)
-            . "」。换量化必须同时换 pack，否则输出会是乱码。"
+        return "pack 与模型不匹配（pack 指向「" . named . "」）：启动时服务端会自动重建（约 3 秒）"
     return ""
-}
-
-; 给某个 GGUF 现做一个 pack（make_pack.py 实测 2-3 秒 / 65 MB）
-MakePackFor(gguf, packsRoot := "") {
-    global PY, ROOT, DEV
-    ; make_pack.py 在 TinyStrata 自己的 tools/ 里（也可能被拷到 checkout 的 tools/）
-    tool := FirstFile(ROOT . "\tools\make_pack.py", DEV . "\tools\make_pack.py",
-                      A_ScriptDir . "\tools\make_pack.py")
-    if (tool = "")
-        return {ok: false, why: "找不到 make_pack.py（应该在 TinyStrata 的 tools\\ 目录里）"}
-    if (PY = "" || !FileExist(PY))
-        return {ok: false, why: "没有可用的 python（" . PY . "）"}
-    packsDir := (packsRoot != "") ? packsRoot : PacksRoot()
-    try DirCreate(packsDir)
-    SetStatusText("正在生成 pack（约 3 秒）…", "000080")
-    logFile := RESULTS . "\make-pack.log"
-    try DirCreate(RESULTS)
-    ; 引号层次与 BuildLaunchCmd 一致：内层整体包一层引号，否则 cmd /c 会把 python 参数剥坏（rc=1）
-    inner := Q(PY) . " -X utf8 " . Q(tool) . " --gguf " . Q(gguf) . " --packs " . Q(packsDir)
-    cmd := Q(A_ComSpec) . " /c " . Q(inner . " > " . Q(logFile) . " 2>&1")
-    try {
-        rc := RunWait(cmd, , "Hide")      ; AHK v2：RunWait 直接返回退出码
-    } catch as e {
-        return {ok: false, why: e.Message}
-    }
-    if (rc != 0)
-        return {ok: false, why: "make_pack.py 退出码 " . rc . "（日志 " . logFile . "）"}
-    pk := FindPackFor(gguf, packsDir)          ; 只在刚生成的那个根里找，别抓到别处的旧 pack
-    if (pk = "")
-        return {ok: false, why: "生成完了但没在 " . packsDir . " 里找到匹配的 pack"}
-    return {ok: true, pack: pk}
 }
 
 PickNative() {
@@ -1177,34 +1145,20 @@ PickNative() {
     if IsObject(sNativeE)
         sNativeE.Value := f
 
-    ; 换 GGUF 就得同时换 pack：先按 native_experts.txt 头里的文件名找，找不到就问要不要现做
+    ; 换 GGUF 只负责"告诉服务层用哪个模型"：pack 是派生数据，由 serve/prepare.py 在引擎启动前
+    ; 发现缺失/不匹配时自己生成（约 3 秒）。启动器保持轻量，不跑 python、不写文件。
     global gPack
-    gPack := ""
     pk := FindPackFor(f)
+    gPack := (pk != "") ? pk : ""
     if (pk != "") {
-        gPack := pk
         SetStatusText("GGUF: " . BaseName(f) . "  ·  pack: " . BaseName(pk), "000080")
         Tip("GGUF: " . BaseName(f) . "`npack: " . BaseName(pk))
-        return
-    }
-    msg := "这个 GGUF 还没有 pack（模型换量化就必须有对应 pack，否则输出是乱码）。`n`n"
-         . "现在生成吗？实测约 3 秒、65 MB（专家仍留在 GGUF 里，不会被复制）。`n`n" . f
-    if (MsgBox(Tf(msg), Tf("TinyStrata 启动器") . " - pack", "Icon? 0x4") != "Yes") {
-        SetStatusText("GGUF: " . BaseName(f) . "  ·  缺 pack（启动会被拦下）", "C00000")
-        return
-    }
-    r := MakePackFor(f)
-    if r.ok {
-        gPack := r.pack
-        SetStatusText("GGUF: " . BaseName(f) . "  ·  已生成 pack: " . BaseName(r.pack), "006400")
-        Tip("pack 已生成: " . BaseName(r.pack))
     } else {
-        MsgBox(Tf("pack 生成失败：`n") . r.why, Tf("TinyStrata 启动器") . " - pack", "Icon!")
-        SetStatusText("pack 生成失败：" . r.why, "C00000")
+        SetStatusText("GGUF: " . BaseName(f) . "  ·  启动时会自动生成 pack（约 3 秒）", "000080")
+        Tip("GGUF: " . BaseName(f) . "`n启动时会自动生成 pack")
     }
 }
 
-; 选 mmproj（覆盖 vision.mmproj）
 PickMmproj() {
     global mmprojE, sMmprojE, visD, sVisD
     cur := ""
@@ -1732,7 +1686,7 @@ Preflight(o, addCheck) {
         warns.Push("没有指定 GGUF 模型文件：用「选择…」（简洁模式也有）选一次，或把配置模板里的 --native / 环境变量设好")
     pp := PackProblem(o)
     if (pp != "")
-        problems.Push(pp)
+        warns.Push(pp)            ; 不是拦下来：服务端会自己准备好
     v := ValidateNumbers(o)
     if !v.ok
         problems.Push("参数错误: " . v.msg)
@@ -3280,15 +3234,6 @@ if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     OnError(SelftestError)
     Selftest()
     ExitApp(0)
-}
-
-if (A_Args.Length >= 2 && A_Args[1] = "--packtest") {
-    ; 手测/支持用：给一个 GGUF 现做 pack（第三个参数可指定 packs 根目录）
-    pkRoot := (A_Args.Length >= 3) ? A_Args[3] : ""     ; 别叫 root：AHK 不区分大小写，会覆盖全局 ROOT
-    r := MakePackFor(A_Args[2], pkRoot)
-    msg := r.ok ? ("OK  " . r.pack) : ("FAIL  " . r.why)
-    FileAppend(msg . "`n", A_ScriptDir . "\strata-launcher-packtest.txt", "UTF-8")
-    ExitApp(r.ok ? 0 : 1)
 }
 
 if (A_Args.Length >= 1 && A_Args[1] = "--about") {

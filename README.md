@@ -140,17 +140,29 @@ The 12 GiB of routed experts stay in the GGUF and are read in place, which is wh
 of the template's `--pack` (default `<install>\packs\`), so you end up with
 `<install>\packs\qwen36-UD-IQ3_S\dense.bin ...`.
 
-**B. Let the launcher build it (3 s)**
+**B. Do nothing (the path for "I only downloaded a GGUF")**
 
-Pick a GGUF in the launcher: it looks for a pack whose `native_experts.txt` names that file. If
-there is none it asks whether to build one -- yes, and it is prepared and wired up on the spot
-(log in `<install>\results\make-pack.log`).
+The launcher only passes the model path. The **server prepares the pack before the engine starts**
+(`serve/prepare.py`, ~3 s): when `--pack` is missing or names a different GGUF it builds one from
+the GGUF's name, repoints `--pack` and `tokenizer`, and only then loads the model:
+
+```
+[prepare] this GGUF has no matching pack: Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+[prepare]   -> <install>\packs\qwen36-ud-iq3_s (about 3 s, the experts stay in the GGUF)
+[prepare] pack ready: <install>\packs\qwen36-ud-iq3_s
+```
+
+The launcher just shows "a pack will be prepared at start (~3 s)" -- it runs no python and writes
+no files.
 
 **C. Command line**
 
 ```powershell
 python tools\make_pack.py --gguf <your.gguf> --packs <install>\packs
 ```
+> The server runs the same `tools/make_pack.py`; you can also run it yourself (to pre-build,
+> or to keep packs on another drive).
+
 
 > **A different quant needs a different pack.** `native_experts.txt` records which GGUF file it
 > points into; pairing the IQ3_S pack with an IQ4_XS model reads garbage without an error. The

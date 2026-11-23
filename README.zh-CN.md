@@ -132,17 +132,27 @@ copy strata-run.py           <install>\tools\
 `Releases → pack-qwen36-UD-IQ3_S.zip`（43.7 MB），解压到模板里 `--pack` 的**上一级**目录
 （默认 `<install>\packs\`），得到 `<install>\packs\qwen36-UD-IQ3_S\dense.bin …`。
 
-**B. 让启动器自动做（3 秒）**
+**B. 什么都不用做（推荐给"只下了 GGUF"的人）**
 
-在启动器里选 GGUF：它会按 `native_experts.txt` 里记录的文件名去找匹配的 pack，
-找到就直接用；找不到会问"现在生成吗？"，点是就当场做好并自动接上
-（输出在 `<install>\results\make-pack.log`）。
+启动器只负责把模型路径传下去；**服务端在引擎启动前自己准备 pack**
+（`serve/prepare.py`，约 3 秒）：它发现 `--pack` 不匹配或缺失，就按 GGUF 文件名
+建好、改掉 `--pack` 和 `tokenizer`，然后才加载模型。日志里会看到：
+
+```
+[prepare] 这个 GGUF 还没有匹配的 pack: Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+[prepare]   -> <install>\packs\qwen36-ud-iq3_s（约 3 秒，专家仍留在 GGUF 里）
+[prepare] pack 就绪: <install>\packs\qwen36-ud-iq3_s
+```
+
+启动器那边只显示一句"启动时会自动生成 pack（约 3 秒）"，它自己**不跑 python、不写文件**。
 
 **C. 命令行**
 
 ```powershell
 python tools\make_pack.py --gguf <你的.gguf> --packs <install>\packs
 ```
+> 服务端用的就是同一个 `tools/make_pack.py`；它也可以单独跑（比如想先预生成、或放到别的盘）。
+
 
 > **换量化必须换 pack。** pack 的 `native_experts.txt` 里写明了它指向哪个 GGUF 文件；
 > 拿 IQ3_S 的 pack 配 IQ4_XS 的模型会静默读出垃圾。启动器现在会在启动前比对文件名，
