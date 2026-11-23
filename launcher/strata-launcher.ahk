@@ -1014,6 +1014,9 @@ Findtest() {
     FT(rep, "ParentDir 普通", ParentDir("D:\a\b\c") = "D:\a\b", ParentDir("D:\a\b\c"))
     FT(rep, "ParentDir 盘根", ParentDir("D:\a") = "D:", ParentDir("D:\a"))
     FT(rep, "ParentDir 只在盘符", ParentDir("D:") = "D:", ParentDir("D:"))
+    FT(rep, "BaseName 认反斜杠", BaseName("D:\a\b.gguf") = "b.gguf", BaseName("D:\a\b.gguf"))
+    FT(rep, "BaseName 认正斜杠", BaseName("E:/m/x/y.gguf") = "y.gguf", BaseName("E:/m/x/y.gguf"))
+    FT(rep, "BaseName 对裸文件名原样返回", BaseName("z.gguf") = "z.gguf", BaseName("z.gguf"))
 
     ; 6) 真实环境：本机应该能定位到引擎
     FT(rep, "本机定位到 strata.exe", gLocated, EXE)
@@ -1113,9 +1116,10 @@ HasArg(flag) {                          ; 命令行开关（--ontop / --selftest
     return false
 }
 
-BaseName(p) {                           ; D:\a\b.exe -> b.exe（nvidia-smi 给的是全路径）
+BaseName(p) {                           ; D:\a\b.exe -> b.exe（配置/nvidia-smi 里 / 和 \ 都可能出现）
     if (p = "")
         return ""
+    p := StrReplace(p, "/", "\\")       ; 归一化，否则正斜杠路径会被整个当成文件名
     return RegExReplace(p, "^.*\\", "")
 }
 
@@ -3590,6 +3594,17 @@ if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     OnError(SelftestError)
     Selftest()
     ExitApp(0)
+}
+
+if (A_Args.Length >= 2 && A_Args[1] = "--packcheck") {
+    ; 支持/自检用：给一个 GGUF，打印启动器会怎么判 pack（空 = 不会弹窗）
+    nv := A_Args[2]
+    pr := PackProblem({native: nv})
+    msg := (pr = "" ? "OK    no pack warning" : "WARN  " . pr)
+    FileAppend(msg . chr(10) . "pack: " . EffectivePack() . chr(10)
+        . "found: " . FindPackFor(nv) . chr(10)
+        . "root: " . PacksRoot() . chr(10), A_ScriptDir . "\strata-launcher-packcheck.txt", "UTF-8")
+    ExitApp(pr = "" ? 0 : 1)
 }
 
 if (A_Args.Length >= 1 && A_Args[1] = "--about") {
