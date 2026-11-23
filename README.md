@@ -1,15 +1,22 @@
-# TinyStrata — Qwen3.6-35B-A3B on a 4 GB card
+# TinyStrata
+
+[简体中文](README.zh-CN.md) | [English](README.md)
+
+目标：在 4G VRAM 显卡中快速、高质量、稳定的运行 MoE 模型（比如 Qwen3.6-35B-A3B）。
+
+**Goal:** run MoE models (for example **Qwen3.6-35B-A3B, 256 experts, 8 per token**) fast, with high
+quality and stable output, on a **4 GB VRAM** card — with a long context that is actually usable.
 
 **TinyStrata** is a patched build of [Strata](https://github.com/Niko1221/Strata) (MIT) aimed at
-one specific target: **Qwen3.6-35B-A3B (MoE, 256 experts, 8 per token) on a 4 GB laptop GPU**, with long
-context actually usable.
+that one target.
 
 Upstream runs this model fine on 8–12 GB cards. On 4 GB the draft layer alone did not fit
 next to an 80 K context, and the decoder had two failure modes we hit in practice (verbatim
 reasoning loops, and parked conversations lost when RAM ran out). TinyStrata is those
 three fixes plus the launcher/benchmarks we used to measure them.
 
-Everything here is a patch on upstream — **no model, no pack, no binary is included.**
+Everything here is a patch on upstream — **no model and no pack is included.** A prebuilt
+`strata.exe` (CUDA 12.8, sm_86) is attached to [Releases](https://github.com/bizhonggeng/TinyStrata/releases/latest); its sha256 is published alongside it.
 
 ## What it changes
 
@@ -58,6 +65,8 @@ smaller quant wins and the i-quant decode path costs nothing extra.
 
 ## Install
 
+Or skip step 3 and take `strata.exe` from [Releases](https://github.com/bizhonggeng/TinyStrata/releases/latest) (CUDA 12.8, sm_86). Patches 1–2 are engine C++ changes, so a binary built from upstream *before* them will not have `--mtp-cpu-moe` or `--dry-multiplier`.
+
 ```bash
 # 1. upstream, at the commit these patches are written against
 git clone https://github.com/aflin/Strata
@@ -74,7 +83,6 @@ cp build-cuda12/strata.exe engine-cuda12/strata.exe
 python setup.py --family qwen36 --model UD-IQ3_S
 ```
 
-Then copy  to , fix its
 Then copy `configs/strata-qwen36-iq3s.example.json` to `D:\dev\strata-qwen36-iq3s.json`,
 fix its `--pack` / `--native` / `--mtp` / `--expert-profile` paths, and start a mode:
 
