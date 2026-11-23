@@ -1,3 +1,6 @@
+# compiled launcher + release artefacts (go to GitHub Releases, not the repo)
+dist/
+
 # engine / build artefacts
 build*/
 engine-*/

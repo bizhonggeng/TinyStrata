@@ -121,7 +121,8 @@ python setup.py --family qwen36 --model UD-IQ3_S
 ### 4.5 启动
 
 **方式 A：图形界面** —— 双击 `TinyStrata-Launcher.exe`（或 `.ahk`），选模式（长/短）→ 启动。
-它自己定位引擎，不用改任何路径；中英文跟随系统语言，菜单栏「语言 / Language」可切。
+它自己定位引擎，不用改任何路径；中英文跟随系统语言，菜单栏「语言 / Language」可切；「关于 / About」里有可点的项目主页 / 上游 / 模型链接，
+还会列出启动器实际定位到的路径（排查「找不到引擎」时看这一屏）。
 启动器自检：`TinyStrata-Launcher.exe --selftest` / `--i18ntest` / `--findtest`（报告落在引擎旁边）。
 
 **方式 B：命令行**

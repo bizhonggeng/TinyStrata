@@ -51,11 +51,15 @@ global SMOKELOG := ""
 global SWITCHLOG := ""
 global I18NLOG  := ""
 global FINDLOG  := ""
+global ABOUTLOG := ""
 global GUARD_LOG := ""
 global TPL_DIR  := ""
 global gLocated := false  ; Locate() 有没有真的找到 strata.exe
 global gLocateHow := ""   ; 从哪个目录找到的（状态行要显示）
-global APP_VER := "0.1.0"       ; 启动器版本（与 Release tag 对齐）
+global APP_VER := "0.1.0"
+global PROJ_URL := "https://github.com/bizhonggeng/TinyStrata"
+global UPSTREAM_URL := "https://github.com/Niko1221/Strata"
+global MODEL_URL := "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"       ; 启动器版本（与 Release tag 对齐）
 global gLang := "zh"            ; "zh" | "en"（InitLang() 里定）
 global EN := Map()
 global ENKeys := []
@@ -90,6 +94,7 @@ global gUiMode := "simple"        ; 当前界面："simple"（简洁）| "pro"�
 global gParams := {}              ; 最近一次完整的参数集合（简洁模式隐藏字段的取值来源）
 global gPro := 0                  ; 专业模式窗口
 global gSimple := 0               ; 简洁模式窗口
+global gAbout := 0                ; 「关于」窗口
 global gLastBasePort := -1        ; 简洁模式里 base_url / 网页聊天链接上次用的端口
 global SIMPLE_W := 460            ; 简洁模式窗口尺寸 + 浏览器那一行的位置（自检会检查它离底部有留白）
 global SIMPLE_H := 486
@@ -109,7 +114,7 @@ global MTP_LIST_LONG := ["cpu", "off"]   ; 长模式只有 cpu/off：专家全�
 ; 找不到就退回老布局（D:\dev\strata\engine-cuda12），让界面还能建出来，Preflight 会报缺件。
 Locate() {
     global DEV, ROOT, EXE, SERVER_PY, PY, DRIVER, BASE_CFG, RESULTS, SESSIONS
-    global GUARD_PY, INI, SELFLOG, SMOKELOG, SWITCHLOG, I18NLOG, FINDLOG, GUARD_LOG, TPL_DIR
+    global GUARD_PY, INI, SELFLOG, SMOKELOG, SWITCHLOG, I18NLOG, FINDLOG, ABOUTLOG, GUARD_LOG, TPL_DIR
     global gLocated, gLocateHow
 
     cands := []
@@ -176,6 +181,7 @@ Locate() {
     SWITCHLOG := DEV . "\strata-launcher-switchtest.txt"
     I18NLOG := DEV . "\strata-launcher-i18ntest.txt"
     FINDLOG := DEV . "\strata-launcher-findtest.txt"
+    ABOUTLOG := DEV . "\strata-launcher-about.txt"
     GUARD_LOG := RESULTS . "\strata-ram-guard.log"
     TPL_DIR := DirExist(DEV . "\templates") ? DEV . "\templates" : ROOT . "\templates"
 }
@@ -500,6 +506,8 @@ LangFill(e) {
     e["可启动"] := "ok"
     e["超过边界，引擎很可能拒绝"] := "over the bound; the engine will likely refuse"
     e["），改完点「启动」"] := "), edit then press Start"
+    e["关于 / About"] := "About"
+    e["语言 / Language"] := "Language"
     return e
 }
 
@@ -579,18 +587,130 @@ SaveLang(v) {
     }
 }
 
-; 语言菜单（两个窗口共用一份定义）：中文 / English / 跟随系统
-AddLangMenu(g) {
+; 菜单栏（两个窗口共用）：语言 / 关于。成熟启动器的惯例：来源、链接、诊断信息都在「关于」里。
+AddMenus(g) {
+    ; ---- 语言 ----
     m := Menu()
     m.Add("简体中文", (*) => SetLang("zh"))
     m.Add("English", (*) => SetLang("en"))
     m.Add()
     m.Add("跟随系统 / Auto", (*) => SetLang(""))
+    ; ---- 关于 ----
+    a := Menu()
+    a.Add("关于 TinyStrata / About", (*) => ShowAbout())
+    a.Add()
+    a.Add("项目主页 / Homepage", (*) => OpenUrl(PROJ_URL))
+    a.Add("上游 Strata / Upstream", (*) => OpenUrl(UPSTREAM_URL))
+    a.Add("模型 / Model (HuggingFace)", (*) => OpenUrl(MODEL_URL))
+    a.Add()
+    a.Add("打开引擎目录 / Open engine folder", (*) => OpenPath(ROOT))
+    a.Add("打开日志目录 / Open logs", (*) => OpenPath(RESULTS))
+    a.Add("打开启动器目录 / Open launcher folder", (*) => OpenPath(A_ScriptDir))
+    a.Add()
+    a.Add("自检（写报告）/ Self-check", (*) => RunSelfCheck())
+
     bar := MenuBar()
     bar.Add(Tf("语言 / Language"), m)
+    bar.Add(Tf("关于 / About"), a)
     g.MenuBar := bar
 }
 
+OpenUrl(u) {
+    try Run(u)
+    catch as e
+        MsgBox(Tf("打不开链接：") . "`n" . u . "`n`n" . e.Message, Tf("TinyStrata 启动器"), "Icon!")
+}
+
+; 从界面里跑一次自检：写报告 + 打开它（比让用户开命令行现实）
+RunSelfCheck() {
+    try {
+        RunWait('"' . A_AhkPath . '" /ErrorStdOut "' . A_ScriptFullPath . '" --selftest', , "Hide")
+    } catch {
+    }
+    if FileExist(SELFLOG)
+        OpenPath(SELFLOG)
+}
+
+; 「关于」：版本 / 定位到的真实路径 / 可点击链接 / 许可。
+; 用自定义窗口而不是 MsgBox —— MsgBox 的文本不能点，Link 控件才能直接用默认浏览器打开。
+AboutIntro() {
+    global gLang
+    if (gLang = "en")
+        return "Goal: run MoE models (e.g. Qwen3.6-35B-A3B) fast, with high quality and stable output" . "`n"
+            . "on a 4 GB VRAM card. This is a patched build of Strata (MIT) plus the launcher;" . "`n"
+            . "no model weights are included."
+    return "目标：在 4 GB 显存的显卡上，快速、高质量、稳定地运行 MoE 模型（如 Qwen3.6-35B-A3B）。`n"
+        . "本项目是 Strata（MIT）的补丁版 + 启动器，不含模型与权重。"
+}
+
+AboutPaths() {
+    global EXE, ROOT, DEV, PY, SERVER_PY, BASE_CFG, gLang
+    cap := (gLang = "en")
+        ? ["engine", "root", "home", "server", "python", "config"]
+        : ["引擎", "项目根", "HOME", "服务层", "Python", "配置"]
+    vals := [EXE, ROOT, DEV, SERVER_PY, PY, BASE_CFG]
+    miss := (gLang = "en") ? "(not found)" : "（未找到）"
+    out := ""
+    for i, v in vals
+        out .= cap[i] . "  " . (v = "" ? miss : v) . "`n"
+    return RTrim(out, "`n")
+}
+
+AboutText() {
+    global APP_VER, gLang
+    head := "TinyStrata 启动器  v" . APP_VER . "`n" . AboutIntro() . "`n`n"
+        . "—— 当前定位 ——`n" . AboutPaths() . "`n`n"
+        . "—— 链接 ——`n" . PROJ_URL . "`n" . UPSTREAM_URL . "`n" . MODEL_URL . "`n`n"
+        . "许可：MIT（补丁与启动器同许可；模型权重遵循其自身许可）"
+    if (gLang = "en")
+        head := "TinyStrata Launcher  v" . APP_VER . "`n" . AboutIntro() . "`n`n"
+            . "-- resolved paths --`n" . AboutPaths() . "`n`n"
+            . "-- links --`n" . PROJ_URL . "`n" . UPSTREAM_URL . "`n" . MODEL_URL . "`n`n"
+            . "Licence: MIT (patches and launcher); model weights keep their own licence."
+    return head
+}
+
+ShowAbout() {
+    global APP_VER, gLang, gAbout
+    if IsObject(gAbout) {
+        try gAbout.Destroy()
+    }
+    en := (gLang = "en")
+    gAbout := Gui("-MaximizeBox -MinimizeBox", Tf("关于 / About") . " - v" . APP_VER)
+    gAbout.SetFont("s9", "Segoe UI")
+    gAbout.MarginX := 14, gAbout.MarginY := 12
+
+    gAbout.SetFont("s11 Bold")
+    gAbout.AddText("w548", "TinyStrata " . (en ? "Launcher" : "启动器") . "  v" . APP_VER)
+    gAbout.SetFont("s9")
+    gAbout.AddText("w548 y+8", AboutIntro())
+    gAbout.AddText("w548 y+10 c404040", en ? "Resolved paths" : "当前定位")
+    pt := gAbout.AddText("w548 h96 c202020", AboutPaths())
+    pt.SetFont("s8", "Consolas")
+
+    gAbout.AddText("w548 y+8 c404040", en ? "Links (click to open)" : "链接（点击打开）")
+    lnk := [["GitHub - TinyStrata", PROJ_URL], ["GitHub - Strata (upstream)", UPSTREAM_URL],
+            ["HuggingFace - Qwen3.6-35B-A3B-MTP-GGUF", MODEL_URL]]
+    for it in lnk
+        gAbout.AddLink("w548 y+6", '<a href="' . it[2] . '">' . it[1] . "</a>")
+
+    gAbout.AddText("w548 y+12 c404040",
+        en ? "Licence: MIT (patches and launcher); model weights keep their own licence."
+           : "许可：MIT（补丁与启动器同许可；模型权重遵循其自身许可）")
+
+    gAbout.AddButton("x14 y+14 w110 h28", en ? "Copy diagnostics" : "复制诊断信息").OnEvent("Click", (*) => (
+        A_Clipboard := AboutText(),
+        ToolTip(en ? "Copied" : "已复制"),
+        SetTimer(() => ToolTip(), -1500)))
+    gAbout.AddButton("x+8 w120 h28", en ? "Engine folder" : "打开引擎目录").OnEvent("Click", (*) => OpenPath(ROOT))
+    gAbout.AddButton("x+8 w120 h28", en ? "Logs folder" : "打开日志目录").OnEvent("Click", (*) => OpenPath(RESULTS))
+    gAbout.AddButton("x+8 w90 h28 Default", en ? "Close" : "关闭").OnEvent("Click", (*) => gAbout.Destroy())
+    gAbout.OnEvent("Close", (*) => gAbout.Destroy())
+    gAbout.OnEvent("Escape", (*) => gAbout.Destroy())
+    gAbout.Show("AutoSize Center")
+}
+
+; 切换语言：存 INI，然后两个窗口一起重建
 ; 切换语言：存 INI，然后两个窗口一起重建（参数集合从界面上收集，不丢设置）
 SetLang(v) {
     global gLang
@@ -2061,7 +2181,7 @@ BuildGui() {
     gLinks := []
     guiAlive := true
     g.OnEvent("Close", OnClose)
-    AddLangMenu(g)
+    AddMenus(g)
     TranslateGui(g)
     return g
 }
@@ -2176,8 +2296,43 @@ SwitchWindows(fromGui, toGui, toShow) {
         WinGetPos(&px, &py, , , "ahk_id " . fromGui.Hwnd)
     fromGui.Hide()
     toGui.Show(toShow)
-    if (px || py)
-        WinMove(px, py, , , "ahk_id " . toGui.Hwnd)
+    hwnd := "ahk_id " . toGui.Hwnd
+    if (px || py) {
+        WinGetPos(, , &w, &h, hwnd)
+        wa := WorkAreaAt(px, py)
+        pos := FitPos(px, py, w, h, wa)
+        WinMove(pos.x, pos.y, , , hwnd)
+    }
+}
+
+; 取某个屏幕坐标所在显示器的工作区（去掉任务栏），拿不到就退回主显示器
+WorkAreaAt(x, y) {
+    try {
+        loop MonitorGetCount() {
+            i := A_Index
+            MonitorGetWorkArea(i, &l, &t, &r, &b)
+            if (x >= l && x < r && y >= t && y < b)
+                return {l: l, t: t, r: r, b: b}
+        }
+        MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+        return {l: l, t: t, r: r, b: b}
+    } catch {
+        return {l: 0, t: 0, r: A_ScreenWidth, b: A_ScreenHeight}
+    }
+}
+
+; 把窗口左上角夹进工作区：先尽量保持原位，放不下就贴边（这就是"专业模式右侧被切掉"的病根）
+FitPos(x, y, w, h, wa) {
+    nx := x, ny := y
+    if (nx + w > wa.r)
+        nx := wa.r - w
+    if (ny + h > wa.b)
+        ny := wa.b - h
+    if (nx < wa.l)
+        nx := wa.l
+    if (ny < wa.t)
+        ny := wa.t
+    return {x: nx, y: ny}
 }
 
 ; 两个界面互切：先把当前界面的值收下来，再喂给另一个界面（不销毁窗口，只 Show/Hide，
@@ -2261,7 +2416,7 @@ BuildSimpleGui() {
 
     gSimple := sg
     sg.OnEvent("Close", OnClose)
-    AddLangMenu(sg)
+    AddMenus(sg)
     TranslateGui(sg)
     return sg
 }
@@ -2615,6 +2770,21 @@ Selftest() {
     } catch as e
         SelfSay("    （布局检查跳过：" . e.Message . "）")
 
+    SelfSay("`n--- 6c. 窗口落位夹取（切模式不许跑出屏幕） ---")
+    wa := {l: 0, t: 0, r: 1920, b: 1040}
+    p1 := FitPos(1200, 100, 1575, 650, wa)          ; 1260x520 在 125% DPI 下的物理尺寸
+    SelfCheck("靠右的专业窗口被夹回屏幕内", p1.x = 345, "x=" . p1.x)
+    p2 := FitPos(0, 900, 600, 650, wa)
+    SelfCheck("靠下的窗口被夹进工作区", p2.y = 390, "y=" . p2.y)
+    p3 := FitPos(100, 100, 600, 400, wa)
+    SelfCheck("放得下就原地不动", p3.x = 100 && p3.y = 100, "x=" . p3.x . " y=" . p3.y)
+    p4 := FitPos(-50, -30, 600, 400, wa)
+    SelfCheck("负坐标夹到工作区左上", p4.x = 0 && p4.y = 0, "x=" . p4.x . " y=" . p4.y)
+    p5 := FitPos(1700, 10, 600, 400, wa)
+    SelfCheck("靠右但放得下 -> 贴右边缘", p5.x = 1320, "x=" . p5.x)
+    p6 := FitPos(1700, 10, 2000, 400, wa)
+    SelfCheck("比工作区还宽时钉在左边界", p6.x = 0, "x=" . p6.x)
+
     SelfSay("`n--- 7. 界面字段往返（建一个隐藏窗口，SetFields -> CollectFields -> 命令行） ---")
     try {
         hg := BuildGui()                      ; 只建不 Show：界面上不弹窗
@@ -2793,6 +2963,18 @@ if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     ExitApp(0)
 }
 
+if (A_Args.Length >= 1 && A_Args[1] = "--about") {
+    txt := AboutText()
+    try {
+        if FileExist(ABOUTLOG)
+            FileDelete(ABOUTLOG)
+        FileAppend(txt . "`n", ABOUTLOG, "UTF-8")
+    }
+    ShowAbout()                                  ; 真正可点链接的那个窗口
+    WinWaitClose("ahk_id " . gAbout.Hwnd)        ; 等用户关掉再退出
+    ExitApp(0)
+}
+
 if (A_Args.Length >= 1 && A_Args[1] = "--i18ntest") {
     OnError(SelftestError)
     I18ntest()
@@ -2833,13 +3015,24 @@ try {
     }
     if HasArg("--switchtest") {             ; 真窗口互切一遍：验证 Show/Hide 这条路径
         res := ""
+        bad := 0
         for m in ["simple", "pro", "simple", "pro"] {
             SwitchTo(m)
             Sleep(600)
+            g := (m = "simple" ? gSimple : gPro)
+            WinGetPos(&wx, &wy, &ww, &wh, "ahk_id " . g.Hwnd)
+            wa2 := WorkAreaAt(wx, wy)
+            inside := (wx >= wa2.l && wy >= wa2.t && wx + ww <= wa2.r + 1 && wy + wh <= wa2.b + 1)
+            if !inside
+                bad++
             res .= m . "→当前=" . gUiMode
+                . " 位置=" . wx . "," . wy . " 尺寸=" . ww . "x" . wh
+                . " 工作区=" . wa2.l . "," . wa2.t . "-" . wa2.r . "," . wa2.b
+                . " 在屏内=" . (inside ? "是" : "否")
                 . " 简洁可见=" . (WinExist("ahk_id " . gSimple.Hwnd) ? "是" : "否")
                 . " 专业可见=" . (WinExist("ahk_id " . gPro.Hwnd) ? "是" : "否") . "`n"
         }
+        res .= "`n结论：" . (bad = 0 ? "四次切换后窗口都在工作区内" : bad . " 次越界") . "`n"
         try FileDelete(SWITCHLOG)
         FileAppend("switchtest " . FormatTime(A_Now, "HH:mm:ss") . "`n" . res, SWITCHLOG, "UTF-8")
         ExitApp(0)
