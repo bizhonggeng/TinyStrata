@@ -135,8 +135,10 @@ The template uses **environment-variable placeholders** (`%STRATA_ROOT%` / `%STR
 
 **A: GUI** — double-click `TinyStrata-Launcher.exe` (or the `.ahk`), pick long/short, press Start.
 It locates the engine by itself, so no path editing. The simple view already has a **Model** group
-with GGUF / mmproj  buttons, so you can point it at the model you just downloaded without
-switching to the pro view. The UI follows the system language and the
+with GGUF / mmproj `Browse...` buttons, so you can point it at the model you just downloaded
+without switching to the pro view. **Vision follows the mmproj**: with none selected the vision
+box is `off` and greyed out (no error); picking an mmproj switches it to `cpu` (no VRAM), and you
+can still choose `gpu` / `off` afterwards. The UI follows the system language and the
 「Language」 and 「About」 menus (About has clickable project / upstream / model links and
 prints the paths the launcher resolved). Launcher self-checks: `TinyStrata-Launcher.exe --selftest` /
 `--i18ntest` / `--findtest` (reports land next to the engine).
