@@ -1280,7 +1280,16 @@ PackProblem(o) {                           ; "" = 没问题；否则是要提醒
     native := Prop(o, "native", "")
     if (native = "")
         return ""                         ; 完全没指定 GGUF 由另一条提醒负责
+    global gPack
     pack := EffectivePack()
+    ; 模板里的 --pack 往往还是别的模型的（IQ3_S），而服务端早已按 GGUF 名建好了这个模型的那份：
+    ; 先按 native_experts.txt 头里的文件名去找，找到就用它，别每次启动都喊"不匹配"。
+    if (pack = "" || StrLower(PackHeaderGguf(pack)) != StrLower(BaseName(native))) {
+        if (pk := FindPackFor(native)) {
+            gPack := pk
+            pack := pk
+        }
+    }
     if (pack = "")
         return en ? ("no pack yet for " . BaseName(native) . ": the server builds one at start (~3 s / 65 MB)")
                   : ("这个 GGUF 还没有 pack：启动时由服务端自动生成（约 3 秒 / 65 MB）")
@@ -1489,6 +1498,7 @@ Normalize(o) {
     n.template := Prop(o, "template", "strata-qwen36-iq3s.json")
     n.native := Prop(o, "native", "")
     n.mmproj := Prop(o, "mmproj", "")
+    n.pack := Prop(o, "pack", "")          ; 找到的 pack 目录（空 = 用模板里的 --pack）
     n.dry := Prop(o, "dry", "")
     n.chat_template := Prop(o, "chat_template", "")
     n.mtp_mode := Prop(o, "mtp_mode", "gpu")
@@ -2238,6 +2248,7 @@ CollectFields() {
     o.template := DdlText(mdlD, "strata-qwen36-iq3s.json")
     o.native := Trim(nativeE.Value)
     o.mmproj := Trim(mmprojE.Value)
+    o.pack := gPack                              ; 与服务端找到/生成的那个具体说清，省一次探测
     o.vision := DdlText(visD, "cpu")
     o.vision_tokens := Trim(vistokE.Value, " `t`r`n")
     o.min_p := Trim(minpE.Value, " `t`r`n")
@@ -2712,6 +2723,7 @@ SimpleCollect() {
     o.apikey := Trim(sKeyE.Value)
     o.native := Trim(sNativeE.Value)          ; 简洁模式也能指定 GGUF（空 = 用模板里的 --native）
     o.mmproj := Trim(sMmprojE.Value)
+    o.pack := gPack
     o.vision := DdlText(sVisD, "cpu")
     o.vision_tokens := Trim(sVisTokE.Value, " `t`r`n")
     o.tag := (o.mode = "long" ? "long" : "")

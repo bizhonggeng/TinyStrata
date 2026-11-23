@@ -386,8 +386,11 @@ Niko1221 及贡献者）。`LICENSE` 是上游原样，派生关系与免责声�
   `qwen35moe` + `block_count 41` + 文件名带 MTP / `strata_inspect.py` 结尾打印
   `with an MTP layer`。
 - **4 GB 卡上的参数**：`UD-IQ3_S` 用短模式即可（MTP 专家在显存）；**`UD-IQ4_XS` 这类更大的量化要把 MTP 专家放到 CPU**
-  （界面上「mtp」选 `cpu`，或 `--spec 2 --mtp-cpu-moe 1`），否则 prefill 的缓冲抢不到显存（症状：`prefill ... out of memory`）。
-  实测：IQ4_XS + `--mtp-cpu-moe` + ctx 20480 → 21 秒就绪，视觉也能起；同参数用 `--spec 3` 会失败。
+  （界面上「mtp」选 `cpu`，或 `--mtp-cpu-moe 1`）：稠密权重更大，draft 层那 439 MiB 显存会让 prefill 抢不到缓冲
+  （症状：`prefill ... out of memory`）。实测 IQ4_XS + `--mtp-cpu-moe` + ctx 20480 → 21 秒就绪，视觉也能起。
+- **`--spec` 不省显存**：验证窗口的缓冲按 `kVerifyMaxT = 8` 一次预分配（`generate.cpp` 里算专家缓存时用的是
+  `kVerifyMaxT`，不是 `--spec`）；它只决定「每轮提几个草稿」→ 接受率与速度。另外 suffix drafter 默认开，
+  启动时会把 `--spec` 再加 2（上限 8），所以 `--spec 2` 实际跑的是 4。
 - **配套 pack**：`UD-IQ3_S` 用 Release 里的 `pack-qwen36-UD-IQ3_S.zip`（43.7 MB）；
   其他量化用 `tools/make_pack.py` 现做（3 秒 / 65 MB）—— 详见 §4.3。
 - 模型许可：Unsloth 的这份 GGUF 是 Apache-2.0；模型权重不在本仓库内。

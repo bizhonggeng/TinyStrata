@@ -400,9 +400,13 @@ The patches are authored as `strata-4gb <strata-4gb@localhost>`; after applying,
   [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md): `qwen35moe` +
   `block_count 41` + an MTP-named file / `strata_inspect.py` printing `with an MTP layer`.
 - **Parameters on a 4 GB card**: `UD-IQ3_S` runs in short mode (MTP experts in VRAM); **a larger quant such as
-  `UD-IQ4_XS` needs the MTP experts on the CPU** (pick `cpu` in the launcher's mtp field, or
-  `--spec 2 --mtp-cpu-moe 1`), otherwise prefill cannot get its scratch buffers (`prefill ... out of memory`). Measured: IQ4_XS + `--mtp-cpu-moe` + ctx 20480 is ready in 21 s
-  with vision on; the same with `--spec 3` fails.
+  `UD-IQ4_XS` needs the MTP experts on the CPU** (pick `cpu` in the launcher's mtp field, or `--mtp-cpu-moe 1`):
+  the dense weights are bigger, so the draft layer's 439 MiB leaves prefill without scratch buffers
+  (`prefill ... out of memory`). Measured: IQ4_XS + `--mtp-cpu-moe` + ctx 20480 is ready in 21 s with vision on.
+- **`--spec` does not save VRAM**: the verify window is allocated for `kVerifyMaxT = 8` up front (the expert
+  cache arithmetic in `generate.cpp` uses `kVerifyMaxT`, not `--spec`); it only decides how many drafts are
+  proposed per round -> acceptance and speed. The suffix drafter is on by default and adds 2 at startup
+  (capped at 8), so `--spec 2` actually runs 4.
 - **Matching pack**: `UD-IQ3_S` uses `pack-qwen36-UD-IQ3_S.zip` from Releases (43.7 MB);
   any other quant: `tools/make_pack.py` builds one in 3 s / 65 MB -- see §4.3.
 - Model licence: this Unsloth GGUF is Apache-2.0. Weights are not part of this repository.
