@@ -56,7 +56,7 @@ global GUARD_LOG := ""
 global TPL_DIR  := ""
 global gLocated := false  ; Locate() 有没有真的找到 strata.exe
 global gLocateHow := ""   ; 从哪个目录找到的（状态行要显示）
-global APP_VER := "0.1.0"
+global APP_VER := "0.1.1"
 global PROJ_URL := "https://github.com/bizhonggeng/TinyStrata"
 global UPSTREAM_URL := "https://github.com/Niko1221/Strata"
 global MODEL_URL := "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"       ; 启动器版本（与 Release tag 对齐）
@@ -118,6 +118,7 @@ Locate() {
     global GUARD_PY, INI, SELFLOG, SMOKELOG, SWITCHLOG, I18NLOG, FINDLOG, ABOUTLOG, GUARD_LOG, TPL_DIR
     global gLocated, gLocateHow
 
+    ; （hit/how 由下面的「显式指定引擎」块初始化）
     cands := []
     if (v := EnvGet("STRATA_HOME")) && v != ""
         cands.Push(v)                        ; 1) 环境变量
@@ -138,8 +139,20 @@ Locate() {
         d := p
     }
 
-    hit := "", how := ""
-    for dir in cands {
+    ; 0) 显式指定引擎（自己编译的、或另一块卡用的那份）：环境变量 > ini
+    override := EnvGet("STRATA_EXE")
+    if (override = "" && FileExist(iniNear)) {
+        try override := IniRead(iniNear, "ui", "exe", "")
+    }
+    if (override != "" && FileExist(override)) {
+        {
+            hit := override
+            how := "（指定）" . ParentDir(override)
+        }
+    }
+
+    hit := (IsSet(hit) ? hit : ""), how := (IsSet(how) ? how : "")
+    for dir in (hit != "" ? [] : cands) {   ; 已经指定了引擎就不再搜目录
         if (dir = "")
             continue
         e := FindEngineIn(dir)
@@ -190,7 +203,8 @@ Locate() {
 
 ; a\b\c -> a\b（盘根不再上溯；已到顶就返回原值）
 ParentDir(p) {
-    p := RTrim(p, "\/")
+    p := StrReplace(p, "/", "\\")          ; 环境变量/配置里常是正斜杠：先归一
+    p := RTrim(p, "\\/")
     if (p = "" || RegExMatch(p, "^[A-Za-z]:$"))
         return p
     q := RegExReplace(p, "\\[^\\]*$", "")
@@ -605,6 +619,7 @@ AddMenus(g) {
     a.Add("上游 Strata / Upstream", (*) => OpenUrl(UPSTREAM_URL))
     a.Add("模型 / Model (HuggingFace)", (*) => OpenUrl(MODEL_URL))
     a.Add()
+    a.Add("选择引擎… / Choose engine…", (*) => PickEngine())
     a.Add("打开引擎目录 / Open engine folder", (*) => OpenPath(ROOT))
     a.Add("打开日志目录 / Open logs", (*) => OpenPath(RESULTS))
     a.Add("打开启动器目录 / Open launcher folder", (*) => OpenPath(A_ScriptDir))
@@ -658,15 +673,38 @@ AboutPaths() {
     return RTrim(out, "`n")
 }
 
+; 「关于」里的运行环境三行：引擎版本、GPU 架构、以及这块卡该用的编译参数
+EnvLines() {
+    global gLang, EXE
+    zh := (gLang != "en")
+    ver := EngineVersion()
+    cap := GpuComputeCap()
+    dll := CudaDlls()
+    out := ""
+    out .= (zh ? "引擎    " : "engine  ") . (ver = "" ? (zh ? "（读不到版本）" : "(no version)") : ver) . "`n"
+    out .= (zh ? "GPU     " : "GPU     ") . (cap = "" ? (zh ? "（读不到）" : "(unknown)") : ("compute " . cap))
+    if (cap != "" && cap != "8.6")
+        out .= zh ? "  ← 本 Release 是 sm_86；这块卡要自己编译：" . ArchFlagFor(cap)
+                  : "  <- this release is sm_86; build your own: " . ArchFlagFor(cap)
+    out .= "`n"
+    out .= (zh ? "CUDA    " : "CUDA    ") . ((dll.cudart != "" && dll.cublas != "")
+        ? (zh ? "运行时齐全（" : "runtime ok (") . dll.where . "）"
+        : (zh ? "缺 cudart64_12.dll / cublas64_12.dll：装 CUDA Toolkit 12.x"
+              : "missing cudart64_12.dll / cublas64_12.dll: install CUDA Toolkit 12.x"))
+    return out
+}
+
 AboutText() {
     global APP_VER, gLang
     head := "TinyStrata 启动器  v" . APP_VER . "`n" . AboutIntro() . "`n`n"
         . "—— 当前定位 ——`n" . AboutPaths() . "`n`n"
+        . "—— 运行环境 ——`n" . EnvLines() . "`n`n"
         . "—— 链接 ——`n" . PROJ_URL . "`n" . UPSTREAM_URL . "`n" . MODEL_URL . "`n`n"
         . "许可：MIT（补丁与启动器同许可；模型权重遵循其自身许可）"
     if (gLang = "en")
         head := "TinyStrata Launcher  v" . APP_VER . "`n" . AboutIntro() . "`n`n"
             . "-- resolved paths --`n" . AboutPaths() . "`n`n"
+            . "-- runtime --`n" . EnvLines() . "`n`n"
             . "-- links --`n" . PROJ_URL . "`n" . UPSTREAM_URL . "`n" . MODEL_URL . "`n`n"
             . "Licence: MIT (patches and launcher); model weights keep their own licence."
     return head
@@ -866,7 +904,7 @@ Findtest() {
     ; 6) 真实环境：本机应该能定位到引擎
     FT(rep, "本机定位到 strata.exe", gLocated, EXE)
     FT(rep, "定位到的 exe 真的存在", FileExist(EXE), EXE)
-    FT(rep, "EXE 文件名正确", SubStr(StrLower(EXE), -10) = "strata.exe", EXE)
+    FT(rep, "EXE 是 .exe（名字不限：自编译的可以任意命名）", SubStr(StrLower(EXE), -4) = ".exe", EXE)
     FT(rep, "定位来源非空", gLocateHow != "", gLocateHow)
 
     DirDelete(t, true)
@@ -1126,6 +1164,107 @@ PackProblem(o) {                           ; "" = 没问题；否则是要拦下
     if (named != "" && StrLower(named) != StrLower(BaseName(native)))
         return "pack 与模型不匹配（pack 指向「" . named . "」）：启动时服务端会自动重建（约 3 秒）"
     return ""
+}
+
+; ---------------------------------------------------------------- 0e. 运行环境自检
+; Release 的 strata.exe 是 sm_86 + CUDA 12.x 编的：缺 DLL 或卡不是 86 时，引擎只会给一句
+; 含糊的 CUDA 错误。这里提前查清楚，给出可操作的提示。
+CudaDlls() {
+    global EXE
+    out := {cudart: "", cublas: "", where: ""}
+    for name in ["cudart64_12.dll", "cublas64_12.dll"] {
+        found := ""
+        if (EXE != "" && FileExist(ParentDir(EXE) . "\" . name))
+            found := ParentDir(EXE)
+        if (found = "") {
+            for d in StrSplit(EnvGet("PATH"), ";") {
+                if (d != "" && FileExist(d . "\" . name)) {
+                    found := d
+                    break
+                }
+            }
+        }
+        if (found = "") {
+            loop files, "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12*\bin\" . name
+                found := ParentDir(A_LoopFileFullPath)
+        }
+        if (name = "cudart64_12.dll")
+            out.cudart := found
+        else
+            out.cublas := found
+    }
+    out.where := (out.cudart != "") ? out.cudart : out.cublas
+    return out
+}
+
+; GPU 的计算能力（8.6 = sm_86）。拿不到返回 ""。
+GpuComputeCap() {
+    try {
+        tmp := A_Temp . "\strata-cap.txt"
+        try FileDelete(tmp)
+        RunWait(Q(A_ComSpec) . " /c nvidia-smi --query-gpu=compute_cap --format=csv,noheader > " . Q(tmp) . " 2>nul", , "Hide")
+        if FileExist(tmp) {
+            v := Trim(FileRead(tmp, "UTF-8"), " `t`r`n")
+            try FileDelete(tmp)
+            return v
+        }
+    }
+    return ""
+}
+
+; 环境问题列表：缺 DLL 是硬伤（引擎起不来），架构不是 86 只是警告（可以自己重编）。
+EnvProblems() {
+    env := {hard: [], soft: []}
+    d := CudaDlls()
+    if (d.cudart = "")
+        env.hard.Push("缺 cudart64_12.dll：装 CUDA Toolkit 12.x，或把配置里的 lib_dirs 指到它的 bin")
+    if (d.cublas = "")
+        env.hard.Push("缺 cublas64_12.dll：同上")
+    cap := GpuComputeCap()
+    if (cap != "" && cap != "8.6") {
+        ; 用中文引号：AHK 字符串里不能直接写英文双引号（要反引号转义，容易出错）
+        env.soft.Push("本 Release 的引擎是 sm_86 编的，这块卡是 compute " . cap
+            . "；可能报「no kernel image」。要在这块卡上跑，请按 README 「自己编译」一节编一份"
+            . "（-DCMAKE_CUDA_ARCHITECTURES=" . StrReplace(cap, ".", "") . "），然后把启动器的引擎路径指向它")
+    }
+    return env
+}
+
+; 引擎自报的版本（`strata.exe --version` -> "strata 0.1.43"），读不到就返回 ""
+EngineVersion() {
+    global EXE
+    if (EXE = "" || !FileExist(EXE))
+        return ""
+    try {
+        tmp := A_Temp . "\strata-ver.txt"
+        try FileDelete(tmp)
+        inner := Q(EXE) . " --version > " . Q(tmp) . " 2>nul"
+        RunWait(Q(A_ComSpec) . " /c " . Q(inner), , "Hide")
+        if FileExist(tmp) {
+            v := Trim(FileRead(tmp, "UTF-8"), " `t`r`n")
+            try FileDelete(tmp)
+            if InStr(v, "strata")
+                return v
+        }
+    }
+    return ""
+}
+
+; 让用户指定自己的 strata.exe（自己编译的那份），记进 ini 的 [ui] exe
+PickEngine() {
+    global INI
+    start := (EXE != "" && FileExist(EXE)) ? EXE : ""
+    f := FileSelect(1, start, "选 strata.exe（自己编译的也可以）", "strata.exe|所有文件 (*.*)")
+    if (f = "")
+        return
+    try IniWrite(f, INI, "ui", "exe")
+    MsgBox(Tf("已记住这个引擎：`n") . f . "`n`n" . Tf("重启启动器后生效（也可以设环境变量 STRATA_EXE）"),
+        Tf("TinyStrata 启动器"), "Iconi")
+}
+
+; 按 GPU 的 compute_cap 给出该用的 -DCMAKE_CUDA_ARCHITECTURES 值（8.6 -> 86）
+ArchFlagFor(cap) {
+    return (cap = "") ? "" : "-DCMAKE_CUDA_ARCHITECTURES=" . StrReplace(StrReplace(cap, ".", ""), " ", "")
 }
 
 PickNative() {
@@ -1687,6 +1826,11 @@ Preflight(o, addCheck) {
     pp := PackProblem(o)
     if (pp != "")
         warns.Push(pp)            ; 不是拦下来：服务端会自己准备好
+    env := EnvProblems()
+    for m in env.hard
+        problems.Push("运行环境: " . m)
+    for m in env.soft
+        warns.Push("运行环境: " . m)
     v := ValidateNumbers(o)
     if !v.ok
         problems.Push("参数错误: " . v.msg)
@@ -2766,6 +2910,17 @@ Selftest() {
     SelfCheck("护栏脚本    " . GUARD_PY, FileExist(GUARD_PY))
     SelfCheck("serve/web/index.html（网页聊天）", FileExist(ROOT . "\serve\web\index.html"))
 
+    SelfSay("`n--- 1b. 运行环境（Release 二进制是 sm_86 + CUDA 12.x）---")
+    dll := CudaDlls()
+    SelfCheck("CUDA 运行时有 cudart64_12.dll", dll.cudart != "", dll.cudart)
+    SelfCheck("CUDA 运行时有 cublas64_12.dll", dll.cublas != "", dll.cublas)
+    cap := GpuComputeCap()
+    SelfSay("    GPU compute_cap = " . (cap = "" ? "（读不到）" : cap))
+    SelfCheck("GPU 是 8.6（否则自编译）", cap = "" || cap = "8.6", cap)
+    SelfCheck("找不到 DLL 时 EnvProblems 会报硬问题",
+        (dll.cudart != "" && dll.cublas != "") || EnvProblems().hard.Length > 0,
+        "hard=" . EnvProblems().hard.Length . " soft=" . EnvProblems().soft.Length)
+
     bats := BatObjects()
     SelfSay("`n--- 2. 参数数组 = 原 .bat 逐字复刻 ---")
     ; 视觉默认值由 Normalize 决定（模板里有真 mmproj 才是 cpu，否则 off）：
@@ -3228,9 +3383,14 @@ Selftest() {
 }
 
 ; ------------------------------------------------- 9. 入口
-SelftestError(err, mode) {              ; 自检出错时写报告文件，绝不弹窗卡住
+SelftestError(err, mode) {              ; 自检/自测出错时写报告文件，绝不弹窗卡住
     global selfBuf
-    try FileAppend(selfBuf . "`n[ERROR] " . err.Message . "  @" . err.Line . "  (" . err.What . ")`n", SELFLOG, "UTF-8")
+    buf := ""
+    try buf := IsSet(selfBuf) ? String(selfBuf) : ""
+    try FileAppend(buf . "`n[ERROR] " . err.Message . "  @" . err.Line . "  (" . err.What . ")`n",
+        SELFLOG, "UTF-8")
+    try FileAppend("[" . FormatTime(A_Now, "HH:mm:ss") . "] " . A_Args[1] . " ERROR: "
+        . err.Message . " @" . err.Line . "`n", A_ScriptDir . "\strata-launcher-error.txt", "UTF-8")
     ExitApp(2)
 }
 

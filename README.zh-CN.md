@@ -61,16 +61,33 @@ TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动
 
 ---
 
-## 3. 硬件要求
+## 3. 硬件与运行环境
 
-| 项 | 要求 | 备注 |
+### 3.1 Release 里的二进制只在下列环境可用
+
+| 项 | 要求 | 不满足会怎样 |
 |---|---|---|
-| 显存 | **4 GB** | 在 RTX 3050 Ti Laptop（sm_86）上编译并实测；8 GB 以上会更轻松 |
-| 内存 | **32 GB** | 专家住在主机内存（UD-IQ3_S 约 12 GiB） |
-| 系统 | Windows x64 | 只在这个平台验证过；引擎本身是跨平台的 |
-| CUDA | **12.8** | Release 里的 `strata.exe` 就是按 12.8 / sm_86 编的 |
-| 磁盘 | GGUF 15.3 GB + setup 建出的 pack（同量级）+ 会话文件（52 K token ≈ 588 MiB） | |
-| 编译才需要 | Python 3.11 venv + `cmake` + `ninja` + MSVC（`vcvars64`） | 只想跑的话用 §4，不用编译 |
+| **GPU 架构** | **sm_86**（Ampere 消费/专业卡：RTX 3050/3060/3070/3080/3090、A10/A40 …） | Release 的 `strata.exe` 只编了 86 一个架构，别的卡会报 "no kernel image" 类错误 → 按 §5 自行编译 |
+| **CUDA 运行时** | **CUDA 12.x** 的 `cudart64_12.dll` 与 `cublas64_12.dll` 要在 `PATH` 上 | 缺 DLL 引擎直接起不来。装 CUDA Toolkit 12.x，或把配置里的 `lib_dirs` 指到它的 `bin` |
+| **驱动** | 支持 CUDA 12.x（R525 以上；实测 621.24） | 同上 |
+| 显存 | **≥ 4 GB** | 不够时引擎拒绝启动，或 `--max-context` 被拒 |
+| 内存 | **32 GB**（专家常驻，约 12 GiB） | 内存护栏会杀进程 |
+| 系统 | **Windows x64** | 本仓库只在 Windows 上验证过 |
+
+> 8 GB 以上的卡当然更宽松，但本仓库所有数字都来自 **RTX 3050 Ti Laptop 4 GB + i5-11400H + 32 GB**。
+
+### 3.2 自己编译时
+
+| 项 | 说明 |
+|---|---|
+| CUDA | 12.8（`build-strata-cuda12.bat`）；其它 12.x 版本一般也能编 |
+| GPU 架构 | `-DCMAKE_CUDA_ARCHITECTURES=86`（默认值就是 86，换卡改成自己的，如 89/120） |
+| 工具链 | Python 3.11 venv + `cmake` + `ninja` + MSVC（`vcvars64`），上游 `START-HERE.bat` 会建 |
+| 磁盘 | 模型 15.3 GB + pack 65 MB + 会话文件（52K token ≈ 588 MB） |
+
+模型：`unsloth/Qwen3.6-35B-A3B-MTP-GGUF` 的 **UD-IQ3_S**（15.3 GB）或 UD-IQ4_XS（18.2 GB）；
+**MTP 层必须在文件里**（`blk.40`），换别的量化先按
+[`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) 的三步判据验一遍。
 
 ---
 
@@ -209,6 +226,7 @@ python tools\make_pack.py --gguf <你的.gguf> --packs <install>\packs
 选了 mmproj 才默认切到 `cpu`（不占显存），之后还能自己改成 `gpu` / `off`。中英文跟随系统语言，菜单栏「语言 / Language」可切；「关于 / About」里有可点的项目主页 / 上游 / 模型链接，
 还会列出启动器实际定位到的路径（排查「找不到引擎」时看这一屏）。
 启动器自检：`TinyStrata-Launcher.exe --selftest` / `--i18ntest` / `--findtest`（报告落在引擎旁边）。
+**引擎可以换**：换成你自己编的那份，用环境变量 `STRATA_EXE` 或菜单「关于 → 选择引擎…」（见 §5.4）。
 
 **方式 B：命令行**
 
@@ -293,6 +311,37 @@ git format-patch -q cd1daa4e..HEAD -o /path/to/TinyStrata/patches --no-signature
 `<models>` / `<packs>` 写在配置模板里，用 `%STRATA_MODELS%` / `%STRATA_PACKS%` 占位
 （见 `configs/README.md`）。
 
+### 5.4 别的 NVIDIA 卡（例如 20 系）：自己编译，启动器照样能用
+
+Release 的引擎只编了 **sm_86**。要在别的卡上跑（20 系 sm_75、40 系 sm_89、50 系 sm_120 …），
+自己编一份就行 —— **启动器和引擎是模块化的**，启动器只管界面和参数，引擎换成谁都能接。
+
+```bash
+# 1) 用你的算力编（下面是常见几张卡的值）
+#    RTX 20xx = 75   RTX 30xx = 86   RTX 40xx = 89   RTX 50xx = 120
+cmake -S . -B build-mine -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-mine --target strata -j 6
+mkdir -p engine-mine && cp build-mine/strata.exe engine-mine/strata.exe
+
+# 2) 告诉启动器用这一份（两种方式，任选）
+#    a) 环境变量
+set STRATA_EXE=<你的目录>\engine-mine\strata.exe
+#    b) 菜单「关于 → 选择引擎…」选一次，会记进 strata-launcher.ini（[ui] exe）
+```
+
+细节：
+
+| 项 | 说明 |
+|---|---|
+| 算力值 | 启动器「关于」里会显示检测到的 `compute_cap`，并按它给出该用的 `-DCMAKE_CUDA_ARCHITECTURES=` 值（8.6 → 86，7.5 → 75） |
+| 引擎名字 | 随便叫（`strata-sm75.exe` 也行），启动器只要求是个 `.exe` |
+| CUDA 版本 | 12.x 都行（Release 用 12.8）；改 `build-strata-cuda12.bat` 里的路径即可 |
+| 引擎换掉之后 | 参数、pack、会话缓存都不用动 —— pack 与服务端的交互与引擎版本无关 |
+| 启动器检测到架构不符时 | 只在启动前给一条**提醒**（不是拦下）：告诉你当前卡是 X、该编什么参数 |
+
+> 为什么不在启动器里内置多架构？一个 sm 架构的 kernel 表就要几十 MB，三四个架构会把
+> 下载体积翻倍。编一份的成本是一次 `cmake --build`，比每次下载都多几十 MB 划算。
 ---
 
 ## 6. 来源（上游）与补丁改动

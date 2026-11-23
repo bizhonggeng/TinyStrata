@@ -67,16 +67,33 @@ smaller quant wins and the i-quant path costs nothing extra.
 
 ---
 
-## 3. Hardware requirements
+## 3. Hardware and runtime
 
-| | Requirement | Note |
+### 3.1 The binaries in Releases only run here
+
+| | Requirement | Otherwise |
 |---|---|---|
-| VRAM | **4 GB** | Built and measured on an RTX 3050 Ti Laptop (sm_86); 8 GB+ is easier |
-| RAM | **32 GB** | The experts live there (~12 GiB for UD-IQ3_S) |
-| OS | Windows x64 | The only platform tested here; the engine itself is portable |
-| CUDA | **12.8** | The `strata.exe` in Releases is built for 12.8 / sm_86 |
-| Disk | GGUF 15.3 GB + the pack `setup.py` builds (same order of magnitude) + session files (52 K tokens ≈ 588 MiB) | |
-| Build only | Python 3.11 venv + `cmake` + `ninja` + MSVC (`vcvars64`) | §4 needs none of this |
+| **GPU arch** | **sm_86** (Ampere consumer/professional: RTX 3050/3060/3070/3080/3090, A10/A40, ...) | the release `strata.exe` is built for arch 86 only; other cards fail with a "no kernel image" error -> build it yourself (§5) |
+| **CUDA runtime** | `cudart64_12.dll` and `cublas64_12.dll` from **CUDA 12.x** must be on `PATH` | without them the engine does not start. Install CUDA Toolkit 12.x or point the config's `lib_dirs` at its `bin` |
+| **Driver** | CUDA 12.x capable (R525 or newer; measured 621.24) | same as above |
+| VRAM | **>= 4 GB** | the engine refuses to start, or `--max-context` is rejected |
+| RAM | **32 GB** (the experts live there, ~12 GiB) | the RAM guard kills the process |
+| OS | **Windows x64** | the only platform this repository was validated on |
+
+> More VRAM is of course easier, but every number here comes from an **RTX 3050 Ti Laptop 4 GB + i5-11400H + 32 GB**.
+
+### 3.2 When you build it yourself
+
+| | Note |
+|---|---|
+| CUDA | 12.8 (`build-strata-cuda12.bat`); other 12.x releases generally work |
+| GPU arch | `-DCMAKE_CUDA_ARCHITECTURES=86` (the default is 86; set your own for other cards, e.g. 89/120) |
+| Toolchain | Python 3.11 venv + `cmake` + `ninja` + MSVC (`vcvars64`); upstream's `START-HERE.bat` creates it |
+| Disk | model 15.3 GB + pack 65 MB + session files (52K tokens ~ 588 MB) |
+
+Model: `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, **UD-IQ3_S** (15.3 GB) or UD-IQ4_XS (18.2 GB);
+**the MTP layer must be inside the file** (`blk.40`). Before switching to another quant run the
+three-step check in [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md).
 
 ---
 
@@ -223,6 +240,8 @@ can still choose `gpu` / `off` afterwards. The UI follows the system language an
 「Language」 and 「About」 menus (About has clickable project / upstream / model links and
 prints the paths the launcher resolved). Launcher self-checks: `TinyStrata-Launcher.exe --selftest` /
 `--i18ntest` / `--findtest` (reports land next to the engine).
+**The engine is swappable**: point it at your own build with `STRATA_EXE` or
+"About -> Choose engine..." (see §5.4).
 
 **B: command line**
 
@@ -307,6 +326,35 @@ This layout is a **default, not a hard-coded path**. Three ways to move things:
 `<models>` / `<packs>` live in the config template as `%STRATA_MODELS%` / `%STRATA_PACKS%`
 placeholders (see `configs/README.md`).
 
+### 5.4 Other NVIDIA cards (e.g. the 20 series): build it, the launcher still works
+
+The released engine is built for **sm_86** only. To run on anything else (20 series sm_75,
+40 series sm_89, 50 series sm_120 ...), build your own -- **the launcher and the engine are
+modular**: the launcher is UI + arguments, the engine is a pluggable binary.
+
+```bash
+# 1) build for your compute capability
+#    RTX 20xx = 75   RTX 30xx = 86   RTX 40xx = 89   RTX 50xx = 120
+cmake -S . -B build-mine -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-mine --target strata -j 6
+mkdir -p engine-mine && cp build-mine/strata.exe engine-mine/strata.exe
+
+# 2) point the launcher at it (either way)
+set STRATA_EXE=<your dir>\engine-mine\strata.exe
+# or: menu "About -> Choose engine..." once; it is remembered in strata-launcher.ini
+```
+
+| | |
+|---|---|
+| Which arch | the launcher's About shows the detected `compute_cap` and the exact `-DCMAKE_CUDA_ARCHITECTURES=` value to use (8.6 -> 86, 7.5 -> 75) |
+| Engine file name | anything ending in `.exe` (`strata-sm75.exe` is fine) |
+| CUDA version | any 12.x (the release uses 12.8); just change the path in `build-strata-cuda12.bat` |
+| After swapping the engine | arguments, pack and session cache keep working -- none of it depends on the engine build |
+| Arch mismatch | the launcher only *warns* before starting (your card is X, build with Y), it never blocks |
+
+> Why not ship several architectures? One arch's kernel tables are tens of MB; three or four of
+> them would double the download. A one-off `cmake --build` is cheaper than shipping all of them.
 ---
 
 ## 6. Upstream and what the patches change
