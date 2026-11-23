@@ -1406,6 +1406,15 @@ ArchFlagFor(cap) {
     return (cap = "") ? "" : "-DCMAKE_CUDA_ARCHITECTURES=" . StrReplace(StrReplace(cap, ".", ""), " ", "")
 }
 
+; 把"用户刚选的模型文件"直接写进 ini 的当前模式节点（SaveIni 只在关窗口时跑，被 kill 就丢）
+RememberModel(key, val) {
+    global INI
+    try {
+        sec := (Prop(CollectCurrent(), "mode", "short") = "long" ? "long" : "short")
+        IniWrite(val, INI, sec, key)
+    }
+}
+
 PickNative() {
     global nativeE, sNativeE
     ; 两个界面各有一份展示框：起始目录取其中已经选过的那个
@@ -1426,6 +1435,7 @@ PickNative() {
     ; 换 GGUF 只负责"告诉服务层用哪个模型"：pack 是派生数据，由 serve/prepare.py 在引擎启动前
     ; 发现缺失/不匹配时自己生成（约 3 秒）。启动器保持轻量，不跑 python、不写文件。
     global gPack
+    RememberModel("native", f)                 ; 立刻记住：进程被 kill 也不会丢这次选择
     pk := FindPackFor(f)
     gPack := (pk != "") ? pk : ""
     if (pk != "") {
@@ -1452,6 +1462,7 @@ PickMmproj() {
         mmprojE.Value := f
     if IsObject(sMmprojE)
         sMmprojE.Value := f
+    RememberModel("mmproj", f)
     ; 选了 mmproj 说明要用视觉：如果当前是 off，默认切成 cpu（用户之后仍可自己改回去）
     if IsObject(visD) && DdlText(visD, "off") = "off"
         visD.Text := "cpu"
@@ -1975,9 +1986,9 @@ Preflight(o, addCheck) {
         sz := 0
         try sz := FileGetSize(nv)
         if (sz > 16 * 1024 ** 3)
-            warns.Push("这个量化 " . Round(sz / 1024 ** 3, 1) . " GB：短模式的 MTP 专家放在显存里，"
-                     . "4 GB 卡上很可能没显存给预填缓冲（症状：prefill ... out of memory）。"
-                     . "改用长模式那套（mtp=cpu / --mtp-cpu-moe 1 --spec 2）")
+            warns.Push("模型 " . BaseName(nv) . " 有 " . Round(sz / 1024 ** 3, 1)
+                . " GiB：短模式把 MTP 专家放在显存里，4 GB 卡上很可能没显存留给预填缓冲"
+                . "（症状：prefill ... out of memory）。把「mtp」改成 cpu（= --mtp-cpu-moe 1 --spec 2）就能跑")
     }
     env := EnvProblems()
     for m in env.hard
@@ -3593,6 +3604,38 @@ SelftestError(err, mode) {              ; 自检/自测出错时写报告文件�
 if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     OnError(SelftestError)
     Selftest()
+    ExitApp(0)
+}
+
+if (A_Args.Length >= 1 && A_Args[1] = "--preflight") {
+    ; 支持/自检用：按 ini 里的设置走一遍预检，打印参数与提醒（不启动任何东西）
+    out := ""
+    try {
+        hg := BuildGui()
+        hg2 := BuildSimpleGui()
+        gPro := hg, gSimple := hg2
+        LoadIni()
+        SetCurrent(gParams)
+        o := CollectCurrent()
+        pf := PreflightNoDlg(o)
+        out .= "mode=" . o.mode . " ctx=" . o.ctx . " kv=" . o.kv . " mtp_mode=" . Prop(o, "mtp_mode", "")
+             . " cpu_moe=" . Prop(o, "mtp_cpu_moe", "") . " spec=" . Prop(o, "spec", "") . chr(10)
+        out .= "native=" . Prop(o, "native", "") . chr(10)
+        out .= "pack=" . Prop(o, "pack", "") . chr(10)
+        try out .= "gguf bytes=" . FileGetSize(Prop(o, "native", "")) . " (" . Round(FileGetSize(Prop(o, "native", "")) / 1024 ** 3, 2) . " GiB)" . chr(10)
+        out .= "--- problems ---" . chr(10) . (pf.ok ? "(none)" : pf.msg) . chr(10)
+        pf2 := Preflight(o, false)                      ; 只算并取字段，不弹窗
+        for w in pf2.warns
+            out .= "warn: " . w . chr(10)
+        out .= "--- warns ---" . chr(10)
+        ; 直接复用 Preflight 内部的提醒来源
+        out .= "vram: " . VramWarnText(GpuSnapshotCached(true), [], true) . chr(10)
+        hg2.Destroy()
+        hg.Destroy()
+    } catch as e {
+        out .= "ERROR " . e.Message . " @" . e.Line . chr(10)
+    }
+    FileAppend(out, A_ScriptDir . "\strata-launcher-preflight.txt", "UTF-8")
     ExitApp(0)
 }
 
