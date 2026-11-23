@@ -1,7 +1,7 @@
 From b7de3e52b4aba87903983f2134712c220e1beed6 Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 21:46:14 +0800
-Subject: [PATCH 8/8] serve: --mtp must be the model we are running
+Subject: [PATCH 8/9] serve: --mtp must be the model we are running
 
 Reported from a real user test: the launcher pointed --native at a new GGUF (UD-IQ4_XS) and the
 server correctly rebuilt the pack, but --mtp still named the old UD-IQ3_S file -- a draft layer

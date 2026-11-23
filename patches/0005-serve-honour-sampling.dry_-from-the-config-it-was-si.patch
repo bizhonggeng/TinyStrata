@@ -1,7 +1,7 @@
 From 2987aeba5e96557f39b7837bb5b65582326e8d39 Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 15:42:59 +0800
-Subject: [PATCH 5/8] serve: honour sampling.dry_* from the config (it was
+Subject: [PATCH 5/9] serve: honour sampling.dry_* from the config (it was
  silently dropped)
 
 sampling_keys() (the DRY patch) emits dry_multiplier/dry_base/dry_allowed_length/

@@ -1,7 +1,7 @@
 From 480dce47f61598d8eaebc1c5c98cd1619478a180 Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 17:41:23 +0800
-Subject: [PATCH 7/8] engine: strata pack --gguf X --out DIR writes the pack
+Subject: [PATCH 7/9] engine: strata pack --gguf X --out DIR writes the pack
  itself, byte-identical to iq_pack.py
 
 The pack is derived data (dense weights in the engine's layout + tensor index + expert offsets),

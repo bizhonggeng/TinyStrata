@@ -1,0 +1,151 @@
+From 70f3ac8fe3690935e62af9d06573c0a0d9701d08 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 22:39:55 +0800
+Subject: [PATCH 9/9] serve: budget the host allocations from the model and the
+ machine
+
+Reported while testing UD-IQ4_XS (14.1 GiB of experts) on a 32 GB box: the template's
+--conversation-cache-mib 4096 plus the 4 GiB the engine keeps free does not fit, and the run
+ended at the Windows commit limit (the 0xC0000409 case the engine warns about). Those numbers
+were measured on a smaller expert set, so they are wrong for a bigger quant.
+
+ensure_budget() (after the pack exists, so its header gives the expert bytes) shrinks only the
+discretionary host allocations, and only when they clearly do not fit:
+  --conversation-cache-mib          fits into , rounded down to a
+                                    256 MiB step, and capped at 1 GiB when the experts take more
+                                    than 40% of physical RAM (a 35B-class model)
+  --conversation-cache-min-free-mib  a 2560 MiB floor is a server default that a 32 GB desktop
+                                    never satisfies -- parking silently never happens
+--max-context / --kv / --expert-cache / --spec / --mtp* stay untouched (policy or VRAM knobs).
+STRATA_NO_BUDGET=1 opts out.
+
+Measured on the portable tree with UD-IQ4_XS: 'experts 14.1 GiB, available 21.4 GiB, room for
+caches 3350 MiB -> --conversation-cache-mib 4096 -> 1024', then ready in 20 s with vision on.
+IQ3_S (12.0 GiB) keeps 4096: its expert set is under the 40% line.
+---
+ serve/prepare.py | 99 ++++++++++++++++++++++++++++++++++++++++++++++++
+ serve/server.py  |  1 +
+ 2 files changed, 100 insertions(+)
+
+diff --git a/serve/prepare.py b/serve/prepare.py
+index 1ac5d6de..be2bc7c3 100644
+--- a/serve/prepare.py
++++ b/serve/prepare.py
+@@ -156,6 +156,105 @@ def nextn_layers(gguf: pathlib.Path) -> int | None:
+         return None
+ 
+ 
++def model_expert_bytes(pack: pathlib.Path | None, gguf: pathlib.Path) -> int | None:
++    """How many bytes the routed experts take in host RAM (the pack's header knows after the first build)."""
++    if pack:
++        hdr = pathlib.Path(pack) / "native_experts.txt"
++        if hdr.is_file():
++            try:
++                m = re.search(r"total (\d+)", hdr.read_text(encoding="utf-8", errors="ignore").splitlines()[0])
++                if m:
++                    return int(m.group(1))
++            except (OSError, IndexError, ValueError):
++                pass
++    try:
++        tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
++        if str(tools) not in sys.path:
++            sys.path.insert(0, str(tools))
++        import gguf_reader as G
++        g = G.GGUFFile(gguf)
++        return sum((t.expected_bytes() or 0) for t in g.tensors if t.name.endswith("_exps.weight"))
++    except Exception:
++        return None
++
++
++def ensure_budget(cfg: dict, log=print) -> bool:
++    """Shrink the discretionary host allocations when the model plus them cannot fit in RAM.
++
++    Only two numbers are touched, and only when they clearly do not fit:
++      * --conversation-cache-mib      the RAM parked conversations may use (up to 4 GiB)
++      * --conversation-cache-min-free-mib  the admission floor (2560 is a server default; a
++        32 GB desktop never satisfies it, so parking silently never happens)
++    --max-context / --kv / --expert-cache / --spec / --mtp* are policy or VRAM knobs and are left
++    alone.  STRATA_NO_BUDGET=1 skips this step.
++    """
++    if os.environ.get("STRATA_NO_BUDGET") == "1":
++        return False
++    args = list(cfg.get("args") or [])
++    native = _arg(args, "--native")
++    if not native:
++        return False
++    gguf = pathlib.Path(native)
++    if not gguf.is_file():
++        return False
++    try:
++        import psutil
++        avail = psutil.virtual_memory().available
++    except Exception:
++        return False
++    pack = _arg(args, "--pack")
++    exp = model_expert_bytes(pathlib.Path(pack) if pack and "%" not in pack else None, gguf)
++    if not exp:
++        return False
++
++    changed = False
++    headroom = 4096 << 20                             # prefill scratch + draft copies + the OS 4 GiB the engine keeps free
++    room = avail - exp - headroom                     # what is left for caches
++    try:
++        physical = psutil.virtual_memory().total
++    except Exception:
++        physical = 0
++    big_model = physical > 0 and exp > physical * 0.40
++    log(f"[prepare] budget: experts {exp / 2**30:.1f} GiB, RAM available {avail / 2**30:.1f} GiB, "
++        f"room for caches {max(0, room) / 2**20:.0f} MiB"
++        + (", 35B-class model -> parked conversations capped at 1 GiB" if big_model else ""))
++
++    def put(flag: str, value: int, why: str) -> None:
++        nonlocal changed
++        i = args.index(flag) + 1
++        old = args[i]
++        args[i] = str(value)
++        changed = True
++        log(f"[prepare] {flag} {old} -> {value} ({why})")
++
++    if "--conversation-cache-mib" in args:
++        try:
++            cur = int(args[args.index("--conversation-cache-mib") + 1])
++        except ValueError:
++            cur = 0
++        fit = max(0, room) >> 20
++        fit = (fit // 256) * 256                      # round down to a round MiB step
++        if big_model:
++            fit = min(fit, 1024)                      # a model that eats 40% of RAM leaves no room for 4 GiB of parks
++        if cur > fit:
++            why = (f"a {exp / 2**30:.0f} GiB expert set leaves {max(0, room) / 2**20:.0f} MiB after the 4 GiB the engine keeps free"
++                   if not big_model else
++                   f"experts eat {exp / (physical / 100):.0f}% of RAM; parked conversations are a luxury there")
++            put("--conversation-cache-mib", max(512, min(cur, fit)), why)
++    if "--conversation-cache-min-free-mib" in args:
++        try:
++            floor = int(args[args.index("--conversation-cache-min-free-mib") + 1])
++        except ValueError:
++            floor = 0
++        if floor > (max(0, room) >> 20):
++            put("--conversation-cache-min-free-mib", 512,
++                "a 2560 MiB floor is a server default: on this machine parking would never be admitted")
++
++    if changed:
++        cfg["args"] = args
++    return changed
++
++
+ def ensure_mtp(cfg: dict, log=print) -> bool:
+     """`--mtp` must be the model we are actually running.
+ 
+diff --git a/serve/server.py b/serve/server.py
+index 52718b3f..91a4b4e5 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6361,6 +6361,7 @@ def main() -> int:
+             prepare_mod.ensure_paths(cfg, log=lambda m: print(m, flush=True))
+             prepare_mod.ensure_mtp(cfg, log=lambda m: print(m, flush=True))
+             pack_changed = prepare_mod.ensure_pack(cfg, log=lambda m: print(m, flush=True))
++            prepare_mod.ensure_budget(cfg, log=lambda m: print(m, flush=True))
+         except Exception as e:                      # never let model preparation kill the server
+             print(f"[strata] pack preparation failed: {e}", flush=True)
+     if pack_changed and cfg.get("tokenizer"):

@@ -1250,7 +1250,7 @@ PacksRoot() {                             ; pack 根目录：模板 --pack 的�
     return ParentDir(p)
 }
 
-FindPackFor(gguf, rootOverride := "") {    ; 按"头里点名的文件"找，不依赖目录命名
+FindPackFor(gguf, rootOverride := "") {    ; 只认 native_experts.txt 头里点名的那个 GGUF（按名字猜会配错）
     packsDir := (rootOverride != "") ? rootOverride : PacksRoot()
     if (gguf = "" || !DirExist(packsDir))
         return ""
@@ -1258,13 +1258,6 @@ FindPackFor(gguf, rootOverride := "") {    ; 按"头里点名的文件"找，不
     loop files, packsDir . "\*", "D" {
         if (StrLower(PackHeaderGguf(A_LoopFileFullPath)) = want)
             return A_LoopFileFullPath
-    }
-    ; 命名约定兜底：<family>-<quant>
-    stem := RegExReplace(BaseName(gguf), "(?i)\.gguf$", "")
-    if RegExMatch(stem, "((?:UD-)?(?:IQ\d[A-Za-z0-9_]*|Q\d(?:_[A-Za-z0-9]+)*))$", &m) {
-        cand := packsDir . "\qwen36-" . StrLower(m[1])
-        if DirExist(cand)
-            return cand
     }
     return ""
 }
@@ -2248,7 +2241,7 @@ CollectFields() {
     o.template := DdlText(mdlD, "strata-qwen36-iq3s.json")
     o.native := Trim(nativeE.Value)
     o.mmproj := Trim(mmprojE.Value)
-    o.pack := gPack                              ; 与服务端找到/生成的那个具体说清，省一次探测
+    o.pack := (o.native = "" ? "" : FindPackFor(o.native))   ; 按当前 GGUF 现查，避免过期/错配
     o.vision := DdlText(visD, "cpu")
     o.vision_tokens := Trim(vistokE.Value, " `t`r`n")
     o.min_p := Trim(minpE.Value, " `t`r`n")
@@ -2723,7 +2716,7 @@ SimpleCollect() {
     o.apikey := Trim(sKeyE.Value)
     o.native := Trim(sNativeE.Value)          ; 简洁模式也能指定 GGUF（空 = 用模板里的 --native）
     o.mmproj := Trim(sMmprojE.Value)
-    o.pack := gPack
+    o.pack := (o.native = "" ? "" : FindPackFor(o.native))
     o.vision := DdlText(sVisD, "cpu")
     o.vision_tokens := Trim(sVisTokE.Value, " `t`r`n")
     o.tag := (o.mode = "long" ? "long" : "")

@@ -82,6 +82,10 @@ smaller quant wins and the i-quant path costs nothing extra.
 
 > More VRAM is of course easier, but every number here comes from an **RTX 3050 Ti Laptop 4 GB + i5-11400H + 32 GB**.
 
+> **RAM is budgeted automatically**: before starting, the server sizes the parked-conversation pool from
+> `expert bytes + available RAM - 4 GiB` (a 35B-class model is capped at 1 GiB) and lowers the parking
+> admission floor to something this machine can satisfy. The `[prepare] budget:` lines say what it did.
+
 ### 3.2 When you build it yourself
 
 | | Note |
