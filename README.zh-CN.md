@@ -78,10 +78,17 @@ TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动
 
 | 文件 | 从哪来 |
 |---|---|
-| `strata.exe` + `strata.exe.sha256` | [**Releases / v0.1.0**](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（61.7 MiB，CUDA 12.8 / sm_86） |
-| `strata-launcher.ahk` | 本仓库 [launcher/](launcher/)（需要 AutoHotkey v2） |
-| `strata-run.py` | 本仓库 [tools/](tools/) |
+| **`TinyStrata-Launcher.exe`** | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（538 KiB，**不装 AutoHotkey 也能跑**） |
+| `strata.exe` + `strata.exe.sha256` | 同上（61.7 MiB，CUDA 12.8 / sm_86） |
+| `strata-launcher.ahk`（可选） | 本仓库 [launcher/](launcher/)（想自己改界面才需要 AutoHotkey v2） |
+| `strata-run.py`（可选） | 本仓库 [tools/](tools/)，命令行驱动 |
 | 模型 GGUF | 见 §7 |
+
+> **启动器会自己找引擎**：从它所在的目录、往上 4 级父目录、以及各自的子目录里搜
+> `strata.exe`（也认 `engine-cuda12\strata.exe` 这种检出布局），然后自动推出
+> python / 驱动 / 配置 / 日志目录。也可以显式指定：环境变量 `STRATA_HOME`，
+> 或在菜单里「浏览…」选一次（记进 ini）。
+> 界面中英双语，**默认跟随系统语言**，菜单栏「语言 / Language」可随时切换。
 
 ```powershell
 # 校验（应输出 9c6f5a0f...）
@@ -113,7 +120,9 @@ python setup.py --family qwen36 --model UD-IQ3_S
 
 ### 4.5 启动
 
-**方式 A：图形界面** —— 双击 `strata-launcher.ahk`，选模式（长/短）→ 启动。
+**方式 A：图形界面** —— 双击 `TinyStrata-Launcher.exe`（或 `.ahk`），选模式（长/短）→ 启动。
+它自己定位引擎，不用改任何路径；中英文跟随系统语言，菜单栏「语言 / Language」可切。
+启动器自检：`TinyStrata-Launcher.exe --selftest` / `--i18ntest` / `--findtest`（报告落在引擎旁边）。
 
 **方式 B：命令行**
 

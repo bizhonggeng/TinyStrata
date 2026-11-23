@@ -84,10 +84,18 @@ smaller quant wins and the i-quant path costs nothing extra.
 
 | File | Where |
 |---|---|
-| `strata.exe` + `strata.exe.sha256` | [**Releases / v0.1.0**](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (61.7 MiB, CUDA 12.8 / sm_86) |
-| `strata-launcher.ahk` | this repo, [launcher/](launcher/) (needs AutoHotkey v2) |
-| `strata-run.py` | this repo, [tools/](tools/) |
+| **`TinyStrata-Launcher.exe`** | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
+| `strata.exe` + `strata.exe.sha256` | same release (61.7 MiB, CUDA 12.8 / sm_86) |
+| `strata-launcher.ahk` (optional) | this repo, [launcher/](launcher/) (only if you want to change the UI) |
+| `strata-run.py` (optional) | this repo, [tools/](tools/), the CLI driver |
 | model GGUF | §7 |
+
+> **The launcher finds the engine itself**: it searches its own directory, four parent
+> directories and their subdirectories for `strata.exe` (including checkout layouts such as
+> `engine-cuda12\strata.exe`), then derives python / driver / config / log paths. Override it
+> with `STRATA_HOME` or pick a folder once from the menu (remembered in the ini).
+> The UI is bilingual, **follows the system language** by default, and the
+> 「语言 / Language」 menu switches it at any time.
 
 ```powershell
 # verify (should print 9c6f5a0f...)
@@ -119,7 +127,10 @@ Copy `configs/strata-qwen36-iq3s.example.json` to `D:\dev\strata-qwen36-iq3s.jso
 
 ### 4.5 Start a mode
 
-**A: GUI** — double-click `strata-launcher.ahk`, pick long/short, press start.
+**A: GUI** — double-click `TinyStrata-Launcher.exe` (or the `.ahk`), pick long/short, press Start.
+It locates the engine by itself, so no path editing; the UI follows the system language and the
+「语言 / Language」 menu switches it. Launcher self-checks: `TinyStrata-Launcher.exe --selftest` /
+`--i18ntest` / `--findtest` (reports land next to the engine).
 
 **B: command line**
 
