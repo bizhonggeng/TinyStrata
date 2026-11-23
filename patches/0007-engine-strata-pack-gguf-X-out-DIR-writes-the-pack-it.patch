@@ -1,0 +1,620 @@
+From 480dce47f61598d8eaebc1c5c98cd1619478a180 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 17:41:23 +0800
+Subject: [PATCH 7/7] engine: strata pack --gguf X --out DIR writes the pack
+ itself, byte-identical to iq_pack.py
+
+The pack is derived data (dense weights in the engine's layout + tensor index + expert offsets),
+so the engine can produce it from a GGUF with no Python, no numpy and no GPU:
+
+    strata pack --gguf model.gguf --out <pack dir> [--compat-bf16]
+
+- include/strata/artifact/pack_build.hpp: header-only port of tools/iq_pack.py's writer --
+  the FORM table, the exact/narrow/widen conversions, 64-byte alignment, index.txt v3 rows
+  (pool offsets filled in a second pass, like write_index), native_experts.txt v3 with the
+  per-role absolute offsets. Quantized sources that need dequantizing report it (the python
+  tool stays the fallback for those).
+- src/program/generate.cpp: the  subcommand (no GPU touched, no model load)
+- serve/prepare.py: prefers , falls back to tools/make_pack.py, then makes
+  sure <pack>/tokenizer exists (the engine has no tokenizer; tools/strata_tokenizer.py does)
+- serve/server.py: ensure_paths now runs before ensure_pack (the packer needs a resolved exe),
+  and slot_save_path is filled when it is still a %placeholder%
+
+Verified:  on Qwen3.6-35B-A3B-UD-IQ3_S produces dense.bin / index.txt /
+native_experts.txt byte-identical to the pack tools/iq_pack.py built (cmp, 3/3), and the
+portable tree goes from one GGUF path to 'ready: http://127.0.0.1:13502/v1' with the engine
+writing the pack.
+---
+ include/strata/artifact/pack_build.hpp | 417 +++++++++++++++++++++++++
+ serve/prepare.py                       |  72 ++++-
+ serve/server.py                        |   2 +
+ src/program/generate.cpp               |  38 +++
+ 4 files changed, 514 insertions(+), 15 deletions(-)
+ create mode 100644 include/strata/artifact/pack_build.hpp
+
+diff --git a/include/strata/artifact/pack_build.hpp b/include/strata/artifact/pack_build.hpp
+new file mode 100644
+index 00000000..c830d8dd
+--- /dev/null
++++ b/include/strata/artifact/pack_build.hpp
+@@ -0,0 +1,417 @@
++// include/strata/artifact/pack_build.hpp - write a pack from a GGUF, inside the engine.
++//
++// The pack is derived data: dense weights in the engine's layout (dense.bin), the tensor index
++// (index.txt) and the expert offsets (native_experts.txt).  tools/iq_pack.py produces the same
++// three files; this is its C++ twin, so a user with only a GGUF needs no Python at all:
++//
++//     strata pack --gguf model.gguf --out <pack dir> [--compat-bf16]
++//
++// Verified byte-identical to `tools/iq_pack.py` on Qwen3.6-35B-A3B-UD-IQ3_S (613 tensors,
++// 252 served natively, 54,610,432 B of dense.bin).
++//
++// Float sources (F32/F16/BF16) are handled here.  A quantized source that the engine reads from
++// the pack (the FORM table) still needs dequantization, which lives in llama.cpp's gguf-py:
++// such a file reports that and the python tool builds it (serve/prepare.py falls back).
++#pragma once
++
++#include <cstdint>
++#include <cstdio>
++#include <filesystem>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "strata/artifact/gguf_reader.hpp"
++
++namespace strata::pack_build {
++
++namespace detail {
++
++inline constexpr int kAlign = 64;
++
++struct Blk { int elems; int bytes; };
++
++// ggml block geometry: elements per block and bytes per block
++inline Blk block_of(uint32_t t) {
++    switch (t) {
++        case 0:  return {1, 4};
++        case 1:  return {1, 2};
++        case 2:  return {32, 18};
++        case 3:  return {32, 20};
++        case 6:  return {32, 22};
++        case 7:  return {32, 24};
++        case 8:  return {32, 34};
++        case 9:  return {32, 36};
++        case 10: return {256, 84};
++        case 11: return {256, 110};
++        case 12: return {256, 144};
++        case 13: return {256, 176};
++        case 14: return {256, 210};
++        case 15: return {256, 292};
++        case 16: return {256, 66};
++        case 17: return {256, 74};
++        case 18: return {256, 98};
++        case 19: return {256, 50};
++        case 20: return {32, 18};
++        case 21: return {256, 110};
++        case 22: return {256, 82};
++        case 23: return {256, 136};
++        case 24: return {1, 1};
++        case 25: return {1, 2};
++        case 26: return {1, 4};
++        case 27: return {1, 8};
++        case 28: return {1, 8};
++        case 29: return {256, 56};
++        case 30: return {1, 2};
++        case 34: return {256, 54};
++        case 35: return {256, 66};
++        default: return {0, 0};
++    }
++}
++
++inline uint64_t nbytes_of(uint32_t type, uint64_t elems) {
++    const Blk b = block_of(type);
++    return b.elems ? (elems / (uint64_t)b.elems) * (uint64_t)b.bytes : 0;
++}
++
++// tools/iq_pack.py's FORM: the float form the engine reads each tensor in
++inline const std::map<std::string, std::string>& form_table() {
++    static const std::map<std::string, std::string> t = {
++        {"ffn_gate_inp.weight", "BF16"}, {"ffn_gate_inp_shexp.weight", "BF16"},
++        {"hc_attn_down.weight", "BF16"}, {"hc_attn_up.weight", "BF16"}, {"hc_attn_inject.weight", "BF16"},
++        {"hc_ffn_down.weight", "BF16"}, {"hc_ffn_up.weight", "BF16"}, {"hc_ffn_inject.weight", "BF16"},
++        {"output_hc_down.weight", "BF16"}, {"output_hc_up.weight", "BF16"},
++        {"indexer.k_proj.weight", "BF16"}, {"indexer.q_proj.weight", "BF16"},
++        {"ssm_alpha.weight", "BF16"}, {"ssm_beta.weight", "BF16"},
++        {"ple_key.weight", "BF16"}, {"ple_value.weight", "BF16"}, {"ple_conv1d.weight", "F16"},
++        {"attn_q_norm.weight", "F32"}, {"attn_k_norm.weight", "F32"}, {"hc_attn_norm.weight", "F32"},
++        {"hc_ffn_norm.weight", "F32"}, {"output_hc_norm.weight", "F32"}, {"indexer.q_norm.weight", "F32"},
++        {"indexer.k_norm.weight", "F32"}, {"ple_norm_conv.weight", "F32"}, {"ple_norm_key.weight", "F32"},
++        {"ple_norm_query.weight", "F32"}, {"ssm_a", "F32"}, {"ssm_conv1d.weight", "F32"}, {"ssm_dt.bias", "F32"},
++        {"ssm_norm.weight", "F32"},
++    };
++    return t;
++}
++
++inline std::string base_name(const std::string& n) {
++    if (n.rfind("blk.", 0) != 0) return n;
++    const size_t dot = n.find('.', 4);
++    return dot == std::string::npos ? n : n.substr(dot + 1);
++}
++
++inline std::string form_of(const std::string& n) {
++    const auto& t = form_table();
++    const auto it = t.find(base_name(n));
++    return it == t.end() ? std::string() : it->second;
++}
++
++inline bool is_float_type(const std::string& t) { return t == "F32" || t == "F16" || t == "BF16"; }
++
++inline bool is_native_ple_key(const std::string& t) {
++    return t == "Q2_0" || t == "Q8_0" || t == "IQ3_XXS" || t == "IQ4_XS";
++}
++
++inline bool is_expert(const std::string& n) {
++    static const std::string k = "_exps.weight";
++    return n.rfind("blk.", 0) == 0 && n.size() > k.size() && n.compare(n.size() - k.size(), k.size(), k) == 0;
++}
++
++inline std::string kind_of(const std::string& type) {
++    if (type == "BF16") return "4";
++    if (type == "F16") return "5";
++    return "2";
++}
++
++inline uint64_t align_up(uint64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
++
++inline std::string basename_of(const std::string& p) {
++    const size_t slash = p.find_last_of("/\\");
++    return slash == std::string::npos ? p : p.substr(slash + 1);
++}
++
++// f32 -> bf16, round-to-nearest-even with a real halfway case (ggml's reference conversion)
++inline uint16_t f32_to_bf16(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, 4);
++    if ((u & 0x7F800000u) != 0x7F800000u) {
++        const uint32_t lsb = (u >> 16) & 1u;
++        u += 0x7FFFu + lsb;
++    }
++    return (uint16_t)(u >> 16);
++}
++
++inline bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n) {
++#if defined(_WIN32)
++    if (_fseeki64(f, (long long)off, SEEK_SET) != 0) return false;   // long is 32-bit: >2 GB tensors
++#else
++    if (fseeko(f, (off_t)off, SEEK_SET) != 0) return false;
++#endif
++    return std::fread(dst, 1, n, f) == n;
++}
++
++}  // namespace detail
++
++/// Write index.txt, dense.bin and native_experts.txt into `out` (created if missing).
++/// `src` is one shard of the model; sharded models are handled by the caller naming shard 1.
++inline bool build(const std::string& src, const std::string& out, bool compat_bf16, std::string& err,
++                  std::string* summary = nullptr) {
++    using namespace detail;
++    try {
++        std::error_code ec;
++        std::filesystem::create_directories(out, ec);      // the caller may hand us a fresh path
++        if (ec && !std::filesystem::is_directory(out)) {
++            err = "cannot create " + out + ": " + ec.message();
++            return false;
++        }
++        GgufFile g(src);
++        const auto& md = g.metadata();
++        auto meta_num = [&](const std::string& k) -> double {
++            const auto it = md.find(k);
++            return it == md.end() ? -1.0 : it->second.num();
++        };
++
++        int64_t n_main = -1;
++        if (const auto it = md.find("general.architecture"); it != md.end()) {
++            const std::string arch = it->second.s;
++            const double blocks = meta_num(arch + ".block_count");
++            const double nextn = meta_num(arch + ".nextn_predict_layers");
++            if (blocks >= 0 && nextn >= 0) n_main = (int64_t)blocks - (int64_t)nextn;
++        }
++        auto is_mtp = [&](const std::string& n) {
++            if (n_main < 0 || n.rfind("blk.", 0) != 0) return false;
++            return std::stoll(n.substr(4)) >= n_main;
++        };
++
++        std::FILE* dense = std::fopen((out + "/dense.bin").c_str(), "wb");
++        if (!dense) { err = "cannot write " + out + "/dense.bin"; return false; }
++
++        struct Row { std::vector<std::string> f; };
++        std::vector<Row> rows;
++        uint64_t dense_at = 0;
++        int served = 0, converted = 0;
++
++        for (const auto& t : g.tensors()) {
++            if (is_expert(t.name) || t.name == "per_layer_token_embd.weight" || is_mtp(t.name)) continue;
++            if (t.shape.size() > 2) {
++                std::fclose(dense);
++                err = "tensor " + t.name + " has more than two dimensions";
++                return false;
++            }
++            const std::string type = t.type_name(), form = form_of(t.name);
++            const bool native = !is_float_type(type) &&
++                                (form.empty() || (t.name == "blk.1.ple_key.weight" && is_native_ple_key(type)));
++            const uint64_t ne0 = t.shape.empty() ? 0 : t.shape[0];
++            const uint64_t ne1 = t.shape.size() > 1 ? t.shape[1] : 0;
++            const uint64_t src_bytes = nbytes_of(t.type, t.elements());
++
++            if (native) {
++                ++served;
++                rows.push_back({{t.name, "0", "0", "0", "0", "0", "0", std::to_string(ne0), std::to_string(ne1),
++                                 "8", "0", "32", "0", "0", "0", "0", "0", "0", "0"}});
++                continue;
++            }
++            if (!is_float_type(type) && form != type) {
++                std::fclose(dense);
++                err = t.name + " is " + type + ", but the engine requires " + form +
++                      "; that needs dequantization (tools/make_pack.py, with --compat-bf16 when asked)";
++                return false;
++            }
++
++            std::vector<uint8_t> raw((size_t)src_bytes);
++            if (src_bytes) {
++                std::FILE* in = std::fopen(src.c_str(), "rb");
++                if (!in) { std::fclose(dense); err = "cannot read " + src; return false; }
++                if (!read_at(in, g.data_start() + t.offset, raw.data(), raw.size())) {
++                    std::fclose(in);
++                    std::fclose(dense);
++                    err = "short read on " + t.name;
++                    return false;
++                }
++                std::fclose(in);
++            }
++
++            std::string kind, data;
++            uint64_t dst_bytes = 0;
++            if (form.empty() || form == type) {
++                kind = kind_of(type);
++                data.assign((const char*)raw.data(), raw.size());
++                dst_bytes = raw.size();
++            } else if (form == "BF16") {
++                if (type != "F32") {
++                    std::fclose(dense);
++                    err = t.name + " is " + type + ", but the engine requires BF16; use tools/make_pack.py --compat-bf16";
++                    return false;
++                }
++                const size_t n = raw.size() / 4;
++                bool exact = true;
++                data.resize(n * 2);
++                for (size_t i = 0; i < n; ++i) {
++                    uint32_t u;
++                    std::memcpy(&u, raw.data() + i * 4, 4);
++                    if (u & 0xFFFFu) exact = false;
++                    const uint16_t b = (uint16_t)(u >> 16);
++                    std::memcpy(&data[i * 2], &b, 2);
++                }
++                if (!exact) {
++                    if (!compat_bf16) {
++                        std::fclose(dense);
++                        err = t.name + " is F32 with values that are not BF16, but the engine requires BF16; "
++                                       "use --compat-bf16 (rounds to nearest-even)";
++                        return false;
++                    }
++                    for (size_t i = 0; i < n; ++i) {
++                        float f;
++                        std::memcpy(&f, raw.data() + i * 4, 4);
++                        const uint16_t b = f32_to_bf16(f);
++                        std::memcpy(&data[i * 2], &b, 2);
++                    }
++                }
++                kind = "4";
++                dst_bytes = data.size();
++                ++converted;
++            } else if (form == "F16") {
++                if (type != "F32") {
++                    std::fclose(dense);
++                    err = t.name + " is " + type + ", but the engine reads F16; use tools/make_pack.py --compat-bf16";
++                    return false;
++                }
++                kind = "3";                       // F32 bytes in, the loader narrows them (as iq_pack does)
++                data.assign((const char*)raw.data(), raw.size());
++                dst_bytes = raw.size() / 2;
++                ++converted;
++            } else {                              // form == "F32": exact widening
++                if (type != "F16" && type != "BF16") {
++                    std::fclose(dense);
++                    err = t.name + " is " + type + ", but the engine reads F32; use tools/make_pack.py --compat-bf16";
++                    return false;
++                }
++                const size_t n = raw.size() / 2;
++                data.resize(n * 4);
++                for (size_t i = 0; i < n; ++i) {
++                    uint16_t h;
++                    std::memcpy(&h, raw.data() + i * 2, 2);
++                    float f;
++                    if (type == "F16") {
++                        const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
++                        const uint32_t exp = (h >> 10) & 0x1F, man = h & 0x3FF;
++                        uint32_t u;
++                        if (exp == 0) {
++                            if (man == 0) {
++                                u = sign;
++                            } else {
++                                uint32_t e = 127 - 15 + 1, m = man;
++                                while (!(m & 0x400)) { m <<= 1; --e; }
++                                u = sign | ((e - 1) << 23) | ((m & 0x3FF) << 13);
++                            }
++                        } else if (exp == 0x1F) {
++                            u = sign | 0x7F800000u | (man << 13);
++                        } else {
++                            u = sign | ((exp - 15 + 127) << 23) | (man << 13);
++                        }
++                        std::memcpy(&f, &u, 4);
++                    } else {
++                        const uint32_t u = (uint32_t)h << 16;   // bf16 -> float
++                        std::memcpy(&f, &u, 4);
++                    }
++                    std::memcpy(&data[i * 4], &f, 4);
++                }
++                kind = "2";
++                dst_bytes = data.size();
++                ++converted;
++            }
++
++            std::fwrite(data.data(), 1, data.size(), dense);
++            const uint64_t pad = align_up(data.size()) - data.size();
++            if (pad) {
++                static const char zeros[kAlign] = {0};
++                std::fwrite(zeros, 1, (size_t)pad, dense);
++            }
++            rows.push_back({{t.name, "0", kind, std::to_string(dense_at), std::to_string(data.size()), "0",
++                             std::to_string(dst_bytes), std::to_string(ne0), std::to_string(ne1), "0", "0", "1",
++                             "0", "0", "0", "0", "0", "0", "0"}});
++            dense_at += data.size() + pad;
++        }
++        std::fclose(dense);
++
++        uint64_t pool = 0;
++        for (auto& r : rows) {
++            r.f[5] = std::to_string(pool);
++            pool += align_up(std::stoull(r.f[6]));
++        }
++
++        std::FILE* idx = std::fopen((out + "/index.txt").c_str(), "wb");
++        if (!idx) { err = "cannot write " + out + "/index.txt"; return false; }
++        std::fprintf(idx,
++                     "# strata pack index v3 -- generated by tools/iq_pack.py (native experts) from %s\n",
++                     basename_of(src).c_str());
++        std::fprintf(idx, "# align %d pool %llu tensors %zu\n", kAlign, (unsigned long long)pool, rows.size());
++        for (const auto& r : rows) {
++            std::string line;
++            for (size_t i = 0; i < r.f.size(); ++i) line += (i ? " " : "") + r.f[i];
++            std::fprintf(idx, "%s\n", line.c_str());
++        }
++        std::fclose(idx);
++
++        // native_experts.txt: one line per layer, written last (it is the pack's completion marker)
++        std::map<std::string, const TensorInfo*> T;
++        for (const auto& t : g.tensors()) T[t.name] = &t;
++        int64_t n_layers = n_main;
++        if (n_layers < 0) {
++            int64_t mx = 0;
++            for (const auto& t : g.tensors())
++                if (t.name.rfind("blk.", 0) == 0 && is_expert(t.name))
++                    mx = std::max<int64_t>(mx, std::stoll(t.name.substr(4)));
++            n_layers = mx + 1;
++        }
++        const auto r0 = T.find("blk.0.ffn_gate_inp.weight");
++        if (r0 == T.end()) { err = "no router tensor (blk.0.ffn_gate_inp.weight)"; return false; }
++        const int64_t n_expert = (int64_t)r0->second->shape[1];
++
++        std::string lines;
++        uint64_t offset = 0;
++        for (int64_t l = 0; l < n_layers; ++l) {
++            const TensorInfo* ts[3] = {nullptr, nullptr, nullptr};
++            const char* roles[3] = {"gate", "up", "down"};
++            for (int i = 0; i < 3; ++i) {
++                const std::string n = "blk." + std::to_string(l) + ".ffn_" + roles[i] + "_exps.weight";
++                const auto it = T.find(n);
++                if (it == T.end()) { err = "layer " + std::to_string(l) + ": missing " + n; return false; }
++                ts[i] = it->second;
++            }
++            const uint64_t per0 = nbytes_of(ts[0]->type, ts[0]->elements()) / (uint64_t)n_expert;
++            const uint64_t per1 = nbytes_of(ts[1]->type, ts[1]->elements()) / (uint64_t)n_expert;
++            const uint64_t per2 = nbytes_of(ts[2]->type, ts[2]->elements()) / (uint64_t)n_expert;
++            const uint64_t blob = per0 + per1 + per2;
++            lines += std::to_string(l) + " " + std::to_string(ts[0]->type) + " " + std::to_string(ts[2]->type) +
++                     " " + std::to_string(offset) + " " + std::to_string(blob) + " " +
++                     std::to_string(g.data_start() + ts[0]->offset) + " " +
++                     std::to_string(g.data_start() + ts[1]->offset) + " " +
++                     std::to_string(g.data_start() + ts[2]->offset) + "\n";
++            offset += blob * (uint64_t)n_expert;
++        }
++        std::FILE* ex = std::fopen((out + "/native_experts.txt").c_str(), "wb");
++        if (!ex) { err = "cannot write " + out + "/native_experts.txt"; return false; }
++        std::fprintf(ex,
++                     "# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
++                     "[shard] (n_expert %lld, total %llu; absolute offsets in %s, or in the named shard beside it)\n",
++                     (long long)n_expert, (unsigned long long)offset, basename_of(src).c_str());
++        std::fwrite(lines.data(), 1, lines.size(), ex);
++        std::fclose(ex);
++
++        if (summary) {
++            char buf[256];
++            std::snprintf(buf, sizeof buf, "index.txt: %zu tensors, %d served natively, arena %.2f GiB; "
++                                           "native_experts.txt: %lld layers, n_expert %lld",
++                          rows.size(), served, pool / 1073741824.0, (long long)n_layers, (long long)n_expert);
++            *summary = buf;
++        }
++        (void)converted;
++        return true;
++    } catch (const std::exception& e) {
++        err = e.what();
++        return false;
++    }
++}
++
++}  // namespace strata::pack_build
+diff --git a/serve/prepare.py b/serve/prepare.py
+index d0e0ab44..7bfa75ac 100644
+--- a/serve/prepare.py
++++ b/serve/prepare.py
+@@ -102,6 +102,17 @@ def ensure_paths(cfg: dict, log=print) -> bool:
+             pass
+         fix(cfg, "log", logdir / "strata.log")
+ 
++    slot = cfg.get("slot_save_path")
++    if slot is None or _unresolved(slot):
++        sess = install / "sessions"
++        try:
++            sess.mkdir(parents=True, exist_ok=True)
++        except OSError:
++            pass
++        cfg["slot_save_path"] = str(sess)
++        changed = True
++        log(f"[prepare] slot_save_path -> {sess}")
++
+     args = list(cfg.get("args") or [])
+     native = _arg(args, "--native")
+     defaults = {"--expert-profile": checkout / "data" / "expert-profile-qwen36.bin",
+@@ -184,25 +195,56 @@ def ensure_pack(cfg: dict, family: str = "qwen36", log=print) -> bool:
+     log(f"[prepare]   {('现有 pack 指向 ' + header_gguf(cur_dir)) if cur_dir and header_gguf(cur_dir) else '没有现成 pack'}")
+     log(f"[prepare]   -> {target}（约 3 秒，专家仍留在 GGUF 里）")
+ 
+-    script = _make_pack_script(pathlib.Path(cfg.get("cwd") or "."))
+-    if script is None:
+-        log("[prepare] 找不到 tools/make_pack.py，无法自动生成；"
+-            "可以手动: python tools/make_pack.py --gguf <模型.gguf> --packs <packs 目录>")
+-        return False
+-
+-    cmd = [sys.executable, str(script), "--gguf", str(gguf), "--packs", str(root), "--family", family]
+-    try:
+-        rc = subprocess.call(cmd)
+-    except OSError as e:
+-        log(f"[prepare] 生成 pack 失败: {e}")
+-        return False
+-    if rc != 0:
+-        log(f"[prepare] make_pack.py 退出码 {rc}；引擎大概率起不来（日志见上）")
+-        return False
++    # 1) 引擎自己会写（strata pack --gguf X --out DIR）：不需要 numpy，也快
++    built = False
++    exe = os.path.expandvars(str(cfg.get("exe") or ""))
++    if exe and pathlib.Path(exe).is_file():
++        try:
++            rc = subprocess.call([exe, "pack", "--gguf", str(gguf), "--out", str(target), "--compat-bf16"])
++        except OSError as e:
++            rc = -1
++            log(f"[prepare] 引擎打包失败（{e}），改用 make_pack.py")
++        if rc == 0 and header_gguf(target).lower() == gguf.name.lower():
++            built = True
++            log("[prepare]   由引擎写出（strata pack）")
++        elif rc != 0:
++            log(f"[prepare] 引擎打包退出码 {rc}，改用 make_pack.py"
++
++                )
++    # 2) 回退：python 的打包器（量化源需要反量化时只能走这条）
++    if not built:
++        script = _make_pack_script(pathlib.Path(cfg.get("cwd") or "."))
++        if script is None:
++            log("[prepare] 既没有可用的引擎，也找不到 tools/make_pack.py；"
++                "可以手动: python tools/make_pack.py --gguf <模型.gguf> --packs <packs 目录>")
++            return False
++        cmd = [sys.executable, str(script), "--gguf", str(gguf), "--packs", str(root), "--family", family]
++        try:
++            rc = subprocess.call(cmd)
++        except OSError as e:
++            log(f"[prepare] 生成 pack 失败: {e}")
++            return False
++        if rc != 0:
++            log(f"[prepare] make_pack.py 退出码 {rc}；引擎大概率起不来（日志见上）")
++            return False
+     if header_gguf(target).lower() != gguf.name.lower():
+         log(f"[prepare] 生成后仍对不上: {target} 指向 {header_gguf(target) or '(空)'}")
+         return False
+ 
++    # tokenizer 是 pack 的一部分，但引擎没有分词器（tools/strata_tokenizer.py 有）:
++    # 引擎只写 index/dense/native_experts，这里补上 tokenizer/
++    if not (target / "tokenizer" / "vocab.json").is_file():
++        tok_py = next((c for c in (pathlib.Path(__file__).resolve().parent.parent / "tools" / "strata_tokenizer.py",
++                                   pathlib.Path(cfg.get("cwd") or ".") / "tools" / "strata_tokenizer.py")
++                       if c.is_file()), None)
++        if tok_py is None:
++            log("[prepare] 找不到 tools/strata_tokenizer.py，tokenizer/ 缺失（服务端会起不来）")
++            return False
++        rc = subprocess.call([sys.executable, str(tok_py), "--gguf", str(gguf), "--out", str(target)])
++        if rc != 0 or not (target / "tokenizer" / "vocab.json").is_file():
++            log(f"[prepare] strata_tokenizer.py 退出码 {rc}，tokenizer/ 仍然缺失")
++            return False
++
+     # 改写 cfg：--pack，以及指向旧 pack 内部的 tokenizer
+     if "--pack" in args:
+         args[args.index("--pack") + 1] = str(target)
+diff --git a/serve/server.py b/serve/server.py
+index 3486c74d..e1b0ff70 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6357,6 +6357,8 @@ def main() -> int:
+     if cfg.get("args"):
+         try:
+             from serve import prepare as prepare_mod
++            # paths first: ensure_pack prefers `strata.exe pack`, which needs a resolved exe
++            prepare_mod.ensure_paths(cfg, log=lambda m: print(m, flush=True))
+             pack_changed = prepare_mod.ensure_pack(cfg, log=lambda m: print(m, flush=True))
+         except Exception as e:                      # never let model preparation kill the server
+             print(f"[strata] pack preparation failed: {e}", flush=True)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 50da9b70..c169b1fa 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -84,6 +84,7 @@
+ #define NOMINMAX   // gguf_reader.hpp includes windows.h
+ #endif
+ #include "strata/artifact/gguf_reader.hpp"
++#include "strata/artifact/pack_build.hpp"
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <psapi.h>
+@@ -1741,6 +1742,43 @@ int main(int argc, char** argv) {
+     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
+     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
+     std::setvbuf(stdout, nullptr, _IONBF, 0);
++    // `strata pack --gguf MODEL.gguf --out DIR [--compat-bf16]`: write the pack and exit, no GPU
++    // and no model load.  serve/prepare.py uses this instead of the Python packer, so a user with
++    // one GGUF needs nothing installed.
++    if (argc >= 2 && std::strcmp(argv[1], "pack") == 0) {
++        std::string gguf, out_dir;
++        bool compat = false;
++        for (int i = 2; i < argc; ++i) {
++            if (std::strcmp(argv[i], "--gguf") == 0 && i + 1 < argc) {
++                gguf = argv[++i];
++            } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
++                out_dir = argv[++i];
++            } else if (std::strcmp(argv[i], "--compat-bf16") == 0) {
++                compat = true;
++            } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
++                std::printf("strata pack --gguf MODEL.gguf --out DIR [--compat-bf16]\n"
++                            "  writes index.txt / dense.bin / native_experts.txt (the same files\n"
++                            "  tools/iq_pack.py writes; no GPU, no model load)\n");
++                return 0;
++            } else {
++                std::fprintf(stderr, "strata pack: unknown argument %s\n", argv[i]);
++                return 2;
++            }
++        }
++        if (gguf.empty() || out_dir.empty()) {
++            std::fprintf(stderr, "usage: strata pack --gguf MODEL.gguf --out DIR [--compat-bf16]\n");
++            return 2;
++        }
++        std::string err, summary;
++        if (!strata::pack_build::build(gguf, out_dir, compat, err, &summary)) {
++            std::fprintf(stderr, "strata pack: %s\n", err.c_str());
++            return 1;
++        }
++        std::printf("%s\n", summary.c_str());
++        std::printf("pack: %s (from %s)\n", out_dir.c_str(), gguf.c_str());
++        return 0;
++    }
++
+     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
+     for (int i = 1; i < argc && i < 3; ++i) {
+         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {

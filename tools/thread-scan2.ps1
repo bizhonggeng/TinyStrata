@@ -1,0 +1,80 @@
+# thread-scan2.ps1 - §7.1 thread sweep, server-based (llama-bench cannot pass the cache flags / has no -c)
+# NOTE: pass lists as comma strings - powershell -File cannot bind Int32[] from "4,6,8"
+param(
+    [string]$Tag = 'avx2',
+    [string]$Threads = '4,6,8,10,12',
+    [string]$Kinds = 'nommap,cache1536',
+    [int]$Runs = 3,
+    [int]$NPredict = 128,
+    [int]$Ctx = 4096,
+    [int]$Port = 1341,
+    [int]$IdleSeconds = 20
+)
+$ErrorActionPreference = 'Continue'
+$bin   = "D:\dev\llama-cpp-moe-cache\dist-$Tag"
+$model = 'E:\models\AesSedai\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-Q4_K_M-00001-of-00002.gguf'
+$out   = 'D:\dev\results'
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+$threadList = @($Threads.Split(',') | ForEach-Object { [int]$_.Trim() })
+$kindList   = @($Kinds.Split(',')   | ForEach-Object { $_.Trim() })
+
+$para = 'The MoE expert cache keeps the most recently used expert weight blocks of a mixture-of-experts model resident in device memory, so that decode steps which route to those experts avoid re-uploading them from host memory across the PCIe bus. '
+$prompt = ($para * 20).Trim()
+
+function ExtraFor($kind) {
+    if ($kind -like 'cache*') {
+        $b = $kind.Substring(5)
+        return @('--moe-expert-cache', '9999', '--moe-expert-cache-budget', $b)
+    }
+    return @()
+}
+
+$rows = @()
+foreach ($t in $threadList) {
+    foreach ($kind in $kindList) {
+        $extra = ExtraFor $kind
+        $slog  = "$out\thread-$Tag-$kind-t$t.log"
+        Write-Host "########## threads=$t kind=$kind ##########"
+        $args = @('-m', $model, '-ngl', '999', '-ncmoe', '999', '-c', "$Ctx", '-ub', '512',
+                  '-ctk', 'q8_0', '-ctv', 'q8_0', '-fa', 'on', '-t', "$t", '--load-mode', 'none',
+                  '--host', '127.0.0.1', '--port', "$Port", '-np', '1') + $extra
+        $p = Start-Process -FilePath "$bin\llama-server.exe" -ArgumentList $args `
+            -RedirectStandardOutput $slog -RedirectStandardError "$slog.err" -PassThru -WindowStyle Hidden
+        $ready = $false
+        for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Seconds 3
+            try { if ((Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 5 -UseBasicParsing).StatusCode -eq 200) { $ready = $true; break } } catch { }
+            if ($p.HasExited) { break }
+        }
+        if (-not $ready) {
+            Write-Host "  NOT READY (threads=$t kind=$kind)"; if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            Start-Sleep -Seconds 10; continue
+        }
+        $body = @{ prompt = $prompt; n_predict = $NPredict; temperature = 0.0; top_k = 1; seed = 1234; cache_prompt = $false } | ConvertTo-Json
+        try { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/completion" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 1800 | Out-Null } catch { }
+        for ($i = 1; $i -le $Runs; $i++) {
+            try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/completion" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 1800
+                $rows += [pscustomobject]@{ threads = $t; kind = $kind; run = $i
+                    pp_tps = [math]::Round($r.timings.prompt_per_second, 2)
+                    tg_tps = [math]::Round($r.timings.predicted_per_second, 2) }
+                Write-Host ("  run {0} => pp={1:N2} tg={2:N2} t/s" -f $i, $r.timings.prompt_per_second, $r.timings.predicted_per_second)
+            } catch { Write-Host "  run $i FAILED: $_" }
+            Start-Sleep -Seconds $IdleSeconds
+        }
+        if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+        Start-Sleep -Seconds 10
+    }
+}
+Write-Host ''
+$rows | Format-Table -AutoSize
+$sum = $rows | Group-Object threads, kind | ForEach-Object {
+    $g = $_.Group; $t = ($g.tg_tps | Sort-Object); $q = ($g.pp_tps | Sort-Object)
+    [pscustomobject]@{ threads = $g[0].threads; kind = $g[0].kind
+        tg_med = if ($t.Count) { $t[[int][math]::Floor($t.Count/2)] } else { $null }
+        pp_med = if ($q.Count) { $q[[int][math]::Floor($q.Count/2)] } else { $null }; n = $t.Count }
+}
+$sum | Sort-Object kind, threads | Format-Table -AutoSize
+$rows | Export-Csv "$out\thread-scan-$Tag-runs.csv" -NoTypeInformation -Encoding utf8
+$sum | ConvertTo-Json -Depth 3 | Out-File "$out\thread-scan-$Tag-summary.json" -Encoding utf8
