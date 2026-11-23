@@ -2,31 +2,38 @@
 
 [简体中文](README.zh-CN.md) | [English](README.md)
 
-目标：在 4G VRAM 显卡中快速、高质量、稳定的运行 MoE 模型（比如 Qwen3.6-35B-A3B）。
+---
 
-**Goal:** run MoE models (for example **Qwen3.6-35B-A3B, 256 experts, 8 per token**) fast, with high
-quality and stable output, on a **4 GB VRAM** card — with a long context that is actually usable.
+## 1. 目标
 
-**TinyStrata** 是 [Strata](https://github.com/Niko1221/Strata)（MIT）的补丁版，只瞄准上面这一个目标。
+> **在 4G VRAM 显卡中快速、高质量、稳定的运行 MoE 模型（比如 Qwen3.6-35B-A3B）。**
 
-上游在 8–12 GB 显卡上跑这个模型没问题。到 4 GB 就不行了：光 draft 层就和 80 K 上下文挤不下，
-而且解码器有两个我们实际踩到的失效模式（逐字重复的推理循环、内存吃紧时被丢弃的 parked 会话）。
-TinyStrata 就是这三个修复，外加用来量化它们的启动器和测速脚本。
+上游 [Strata](https://github.com/Niko1221/Strata) 在 8–12 GB 显卡上跑 Qwen3.6-35B-A3B 没问题。
+压到 4 GB 会同时撞上三堵墙：
 
-这里的一切都是针对上游的补丁 —— **不含模型、不含 pack。** 预编译的 `strata.exe`
-（CUDA 12.8、sm_86）挂在 [Releases](https://github.com/bizhonggeng/TinyStrata/releases/latest)，同一页给出 sha256。
+1. **装不下** —— 光 MTP draft 层就要 439 MiB，和 80 K 上下文的 KV 挤不下；
+2. **说重复的话** —— 长上下文下会进入逐字重复的推理循环，烧掉几万 token 却不给答案；
+3. **会话丢失** —— 内存吃紧时 parked 会话被丢弃，切回来等于重读几小时 prompt。
 
-## 改了什么
+TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动器、驱动和测速脚本。
+它很小：**3 个补丁（约 430 行）+ 一套工具**，不是整树 fork。
 
-| 补丁 | 作用 | 实测效果（RTX 3050 Ti 4 GB + i5-11400H + 32 GB） |
+---
+
+## 2. 特性
+
+| # | 特性 | 说明 |
 |---|---|---|
-| `0001-mtp-cpu-moe` | MTP draft 层的 256 个路由专家搬到主机内存、跑在 CPU 上（`--mtp-cpu-moe`）；CPU 路径跳过 CUDA graph 捕获 | draft 层显存 **439 → 127 MiB**，这才让 `--max-context 81920` 保得住 MTP。decode 24.7 tok/s @65 K（draft 接受 87 %），18.6–21.5 tok/s @80 K（88–89 %） |
-| `0002-dry-sampler` | 把 llama.cpp 的 **DRY** 采样器做成 logits 前置 kernel：惩罚随 *重复序列* 长度增长，而不是随 token 频次 | 默认关闭（逐位不变）。`--dry-multiplier 1.5` 时，一道"烧了 700 token 静默 thinking、答案 0 字"的编码题产出了正确函数 |
-| `0003-serve-setup-tools` | 会话自动存盘（parked 会话的磁盘兜底）、每行日志带 `HH:MM:SS`、`--chat-template-file`、多三个可选 i-quant | 52 K token 对话 **0.47 s** 恢复，替代 314 s 的重读；那个量化白名单是"钉了 sha256 的策展名单"，不是格式限制 |
+| 1 | **MTP 专家上 CPU**（`--mtp-cpu-moe`） | draft 层的 256 个路由专家搬到主机内存、跑在 CPU 上，CPU 路径跳过 CUDA graph 捕获。draft 层显存 **439 → 127 MiB**，这才让 `--max-context 81920` 保得住投机解码 |
+| 2 | **DRY 采样器**（`--dry-multiplier`） | llama.cpp 的 DRY 做成 logits 前置 kernel：惩罚随**重复序列长度**增长，而不是随 token 频次。默认关闭（逐位不变），专治逐字重复的推理循环 |
+| 3 | **会话自动存盘** | 请求完成后按指纹自动 SAVE 到磁盘，切回自动 RESTORE。52 K token 对话 **0.47 s** 恢复，替代 314 s 的重读；parked 会话的磁盘兜底 |
+| 4 | **日志时间戳** | 引擎与驱动每一行都带 `HH:MM:SS`（1150 处 `fprintf` 不动 C++，用管道加戳），排查时序问题不用再猜 |
+| 5 | **图形启动器** | AutoHotkey v2，专业/简洁双视图、参数网格、模型/GGUF/mmproj 选择器、视觉、chat 模板、运行状态、日志尾部、按模式存 INI。自带 `--selftest` |
+| 6 | **驱动与工具** | `strata-run.py`（一条命令起一个模式）、`watch-loop.py`（双源循环监控）、`ab-*.py`（预热+交错+中位的 A/B 测速） |
 
-## 数字
+### 2.1 实测性能
 
-两个模式，都在本机实测（交错运行、三轮取中位、每轮前预热 —— 协议见 `docs/4GB-TUNING.md`）：
+本机 RTX 3050 Ti Laptop **4 GB** + i5-11400H + 32 GB，两套参数：
 
 | | 短模式 | 长模式 |
 |---|---|---|
@@ -34,55 +41,81 @@ TinyStrata 就是这三个修复，外加用来量化它们的启动器和测速
 | KV | `k8v4`，全驻留 | `k8v4`，全驻留 |
 | MTP | 开，专家**在 GPU**（`--spec 3`） | 开，专家**在 CPU**（`--mtp-cpu-moe 1`，`--spec 2`） |
 | `--vram-reserve-mib` | 64 | 64 |
-| 能启动的最大上下文 | 39936 | 81920 |
-| decode | ~32–36 tok/s | ~18 tok/s @79 K，~25 tok/s @30 K |
-| prefill | ~250 tok/s | **153.8 tok/s @79 K** |
+| `--expert-cache` | 800 | 800 |
+| 能启动的最大上下文 | 39936 | **81920** |
+| **decode** | ~32–36 tok/s | **18.00 tok/s @79 K**（3 轮中位） |
+| **prefill** | ~250 tok/s | **153.8 tok/s @79 K** |
 
-同一条 79 K prompt、同一台机器，对比 llama.cpp（b11382）跑同族模型的 `Q4_K_M`（`--spec-type
-draft-mtp`、`-cth/-ctv q8_0`、`-ncmoe 999`）：
+同一条 79 K prompt、同一台机器，对比 llama.cpp（b11382）跑同族模型的 `Q4_K_M`：
 
 | | TinyStrata（UD-IQ3_S，3.46 bit/w） | llama.cpp（Q4_K_M，5.19 bit/w） |
 |---|---:|---:|
 | prefill @79 K | **153.8 tok/s** | 103.3 tok/s |
-| decode @79 K（3 轮中位） | **18.00 tok/s** | 12.35 tok/s |
+| decode @79 K | **18.00 tok/s** | 12.35 tok/s |
 | draft 接受率 | 71–78 % | 65–78 % |
 
-两个速度的比值（decode 1.46、prefill 1.49）几乎正好等于权重大小之比（5.19 / 3.46 = 1.50）：这个
-尺寸下解码是**搬运字节数**问题，所以更小的量化赢，i-quant 的解码路径没有额外代价。
+两个速度的比值（decode 1.46、prefill 1.49）几乎正好等于权重大小之比（5.19 / 3.46 = 1.50）：
+这个尺寸下解码是**搬运字节数**问题，所以更小的量化赢，i-quant 没有额外代价。
 
-## 要求
+---
 
-- **4 GB 显存**（在 RTX 3050 Ti Laptop、sm_86 上编译和实测），CUDA 12.8，Windows。
-- **32 GB 内存** —— 专家就住在那里（UD-IQ3_S 约 12 GiB）。
-- Python 3.11 虚拟环境 + `cmake`/`ninja` 用来编译引擎（上游的 `START-HERE.bat` 会建）。
-- 模型：`unsloth/Qwen3.6-35B-A3B-MTP-GGUF` —— **UD-IQ3_S**（15.3 GB，本文数字用的就是它）
-  或 UD-IQ4_XS（18.2 GB）。MTP 层必须在文件里（`blk.40`）；换别的量化之前先读
-  `docs/GGUF-SELECTION-STANDARD.md`。
+## 3. 硬件要求
 
-## 安装
+| 项 | 要求 | 备注 |
+|---|---|---|
+| 显存 | **4 GB** | 在 RTX 3050 Ti Laptop（sm_86）上编译并实测；8 GB 以上会更轻松 |
+| 内存 | **32 GB** | 专家住在主机内存（UD-IQ3_S 约 12 GiB） |
+| 系统 | Windows x64 | 只在这个平台验证过；引擎本身是跨平台的 |
+| CUDA | **12.8** | Release 里的 `strata.exe` 就是按 12.8 / sm_86 编的 |
+| 磁盘 | GGUF 15.3 GB + setup 建出的 pack（同量级）+ 会话文件（52 K token ≈ 588 MiB） | |
+| 编译才需要 | Python 3.11 venv + `cmake` + `ninja` + MSVC（`vcvars64`） | 只想跑的话用 §4，不用编译 |
 
-也可以跳过第 3 步，直接用 [Releases](https://github.com/bizhonggeng/TinyStrata/releases/latest) 里的 `strata.exe`（CUDA 12.8、sm_86）。
-注意补丁 1–2 是引擎 C++ 改动，所以**打补丁之前**编出来的上游二进制没有
-`--mtp-cpu-moe` 和 `--dry-multiplier`。
+---
 
-```bash
-# 1. 上游，切到这些补丁针对的 commit
-git clone https://github.com/aflin/Strata
-cd Strata && git checkout cd1daa4e          # "Merge upstream/main (0.1.43) into qwen36-35b-support"
+## 4. 快速入门（下载即用，不用编译）
 
-# 2. 打补丁
-git am /path/to/TinyStrata/patches/*.patch
+### 4.1 下载
 
-# 3. 编译引擎（用上游自己的脚本；CUDA 12.8，sm_86）
-cmd /c build-strata-cuda12.bat
-cp build-cuda12/strata.exe engine-cuda12/strata.exe
+| 文件 | 从哪来 |
+|---|---|
+| `strata.exe` + `strata.exe.sha256` | [**Releases / v0.1.0**](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（61.7 MiB，CUDA 12.8 / sm_86） |
+| `strata-launcher.ahk` | 本仓库 [launcher/](launcher/)（需要 AutoHotkey v2） |
+| `strata-run.py` | 本仓库 [tools/](tools/) |
+| 模型 GGUF | 见 §7 |
 
-# 4. 一次性：从 GGUF 建 pack（写出专家 pack + profile）
+```powershell
+# 校验（应输出 9c6f5a0f...）
+Get-FileHash strata.exe -Algorithm SHA256
+Get-Content strata.exe.sha256
+```
+
+### 4.2 就位
+
+```powershell
+copy strata.exe D:\dev\strata\engine-cuda12\strata.exe
+copy strata-launcher.ahk D:\dev\
+copy strata-run.py D:\dev\tools\
+```
+
+目录可以不一样，只要改两处常量（见 §5.3）。
+
+### 4.3 建一次 pack（必须做一次，之后复用）
+
+```powershell
+cd D:\dev\strata
 python setup.py --family qwen36 --model UD-IQ3_S
 ```
 
-然后把 `configs/strata-qwen36-iq3s.example.json` 复制成 `D:\dev\strata-qwen36-iq3s.json`，
-改掉里面的 `--pack` / `--native` / `--mtp` / `--expert-profile` 路径，再启动某个模式：
+### 4.4 配模板
+
+把 `configs/strata-qwen36-iq3s.example.json` 复制成 `D:\dev\strata-qwen36-iq3s.json`，
+改掉里面的 `--pack` / `--native` / `--mtp` / `--expert-profile` 四个路径。
+
+### 4.5 启动
+
+**方式 A：图形界面** —— 双击 `strata-launcher.ahk`，选模式（长/短）→ 启动。
+
+**方式 B：命令行**
 
 ```bash
 # 长模式（80 K，MTP 专家在 CPU）—— 本仓库讲的就是这个模式
@@ -93,12 +126,54 @@ python tools/strata-run.py --tag long --ctx 81920 --kv k8v4 --vram-reserve-mib 6
 python tools/strata-run.py --ctx 20480 --kv k8v4 --vram-reserve-mib 64 --mtp on --spec 3
 ```
 
-`launcher/strata-launcher.ahk` 是套在同样两个模式上的 AutoHotkey v2 图形界面（参数网格、
-模型/GGUF/mmproj 选择器、视觉、chat 模板文件、运行状态、日志尾部）。`--selftest` 跑它自带的检查。
+### 4.6 自检两个关键 flag
 
-## 目录假设
+```powershell
+D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
+D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
+```
 
-脚本假设下面这个布局；换布局只要改两个常量：`tools/strata-run.py` 顶部和启动器里的 `DEV`，以及 `ROOT`。
+两行都得有输出。上游原版编出来的二进制**没有**这两行。
+
+---
+
+## 5. 安装（自行编译 / 修改）
+
+### 5.1 编译
+
+```bash
+# 1. 上游，切到这些补丁针对的 commit
+git clone https://github.com/Niko1221/Strata
+cd Strata && git checkout cd1daa4e          # "Merge upstream/main (0.1.43) into qwen36-35b-support"
+
+# 2. 打补丁
+git am /path/to/TinyStrata/patches/*.patch
+
+# 3. 编译引擎（用上游自己的脚本；CUDA 12.8，sm_86）
+cmd /c build-strata-cuda12.bat
+cp build-cuda12/strata.exe engine-cuda12/strata.exe
+
+# 4. 一次性：从 GGUF 建 pack
+python setup.py --family qwen36 --model UD-IQ3_S
+```
+
+> **必读的部署坑**：`cmake --build` 只写 `build-cuda12/strata.exe`，
+> 运行时读的是 `engine-cuda12/strata.exe` —— **不 `cp` 就等于没改**。
+
+### 5.2 改代码
+
+补丁里的改动都是小块的、有注释的：`src/core/mtp.cpp`（专家卸载）、
+`sampler.hpp` / `sampler.cu`（DRY kernel）、`src/program/generate.cpp`（参数解析）、
+`serve/`（autosave、日志时间戳）。重新生成补丁：
+
+```bash
+cd D:/dev/strata
+git format-patch -q cd1daa4e..HEAD -o ../dist/TinyStrata/patches --no-signature
+```
+
+### 5.3 目录假设
+
+脚本假设下面这个布局；`DEV`（`tools/strata-run.py` 顶部和启动器里）和 `ROOT` 是唯一要改的两个常量。
 
 ```
 D:\dev\
@@ -112,20 +187,84 @@ E:\models\unsloth\Qwen3.6-35B-A3B-MTP-GGUF\   GGUF（图片还要 mmproj-F32.ggu
 E:\Strata-data\packs\qwen36-UD-IQ3_S\         setup.py 建出的 pack
 ```
 
-## 局限（提 issue 前先读）
+---
 
-- **pi 的 compaction 是前缀复用的硬断点**：被 compact 的对话要整体重读一次 prompt（本机 37 K
-  token 约 2 分钟）。所有做 token 前缀匹配的引擎都有这个问题。
+## 6. 来源（上游）与补丁改动
+
+**TinyStrata 是 [Strata](https://github.com/Niko1221/Strata) 的衍生作品**（MIT，Copyright (c) 2026
+Niko1221 及贡献者）。`LICENSE` 是上游原样，派生关系与免责声明见 [`NOTICE.md`](NOTICE.md)。
+
+| | |
+|---|---|
+| 上游 | <https://github.com/Niko1221/Strata> |
+| 补丁基线 | `cd1daa4e` — "Merge upstream/main (0.1.43) into qwen36-35b-support" |
+| 基线来源分支 | `aflin/Strata` 的 `qwen36-35b-support`（PR #1402：Qwen3.6-35B-A3B 支持） |
+
+### 6.1 三个补丁
+
+| 补丁 | 改了哪里 | 效果（4 GB 实测） |
+|---|---|---|
+| [`0001-mtp-mtp-cpu-moe`](patches/0001-mtp-mtp-cpu-moe-the-draft-layer-s-256-experts-on-the.patch) | `src/core/mtp.cpp`、`src/program/generate.cpp`：新增 `--mtp-cpu-moe`，draft 专家走 CPU、跳过 graph capture | draft 层显存 **439 → 127 MiB**；decode 24.7 tok/s @65 K（接受 87 %）、18.6–21.5 tok/s @80 K |
+| [`0002-sampler-DRY`](patches/0002-sampler-DRY-a-penalty-that-grows-with-the-length-of-.patch) | `sampler.hpp` / `sampler.cu` / `generate.cpp`：DRY 前置 kernel + 四个 `--dry-*` 参数，覆盖 greedy/sampled/split-merge 全路径 | 编码题：关闭时 2529 字 thinking / **答案 0 字**；`--dry-multiplier 1.5` 时 1737 字 + 正确函数 |
+| [`0003-serve-setup-tools`](patches/0003-serve-setup-tools-session-autosave-log-timestamps-ch.patch) | `serve/autosave.py`（新）、`serve/server.py`、`setup.py`、`tools/strata_inspect.py`：会话自动存盘、日志时间戳、`--chat-template-file`、放开量化白名单 | 52 K token 恢复 **0.47 s**（替代 314 s）；save 380 ms / restore 143 ms；`--expert-cache 800` 让 prefill 快 27–45 % |
+
+补丁作者是 `strata-4gb <strata-4gb@localhost>`；想署自己的名字，apply 后
+`git commit --amend --reset-author` 即可。
+
+---
+
+## 7. 适配模型
+
+| 模型 | 量化 | 大小 | 说明 |
+|---|---|---|---|
+| [**unsloth/Qwen3.6-35B-A3B-MTP-GGUF**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **UD-IQ3_S** | 15.3 GB | **本仓库所有数字都是在它上面测的**。推荐首选 |
+| 同上 | UD-IQ4_XS | 18.2 GB | 4 GB 上也跑得起来，prefill 稍慢、质量略高 |
+| 同上 | `mmproj-F32.gguf` | — | 需要图片输入（视觉）时才下 |
+
+- 国内下载：把域名换成 `hf-mirror.com` 即可（`HF_ENDPOINT=https://hf-mirror.com`）。
+- **MTP 层必须在 GGUF 里**（`blk.40`）。下载别的量化/别的来源之前，先按
+  [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) 的三步判据验一遍：
+  `qwen35moe` + `block_count 41` + 文件名带 MTP / `strata_inspect.py` 结尾打印
+  `with an MTP layer`。
+- 模型许可：Unsloth 的这份 GGUF 是 Apache-2.0；模型权重不在本仓库内。
+
+---
+
+## 8. 相关文档
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/4GB-TUNING.md`](docs/4GB-TUNING.md) | 4 GB 调参全记录：每个参数为什么是这个值、测速协议（预热 → 交错 → 3 轮中位）、噪声量级（换实例 ±6 %） |
+| [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) | 挑 GGUF 的硬性判据、危险信号、三步筛选流程 |
+| [`launcher/strata-launcher.ahk`](launcher/strata-launcher.ahk) | 图形启动器（AHK v2，自带 `--selftest` / `--guismoke` / `--switchtest`） |
+| [`tools/strata-run.py`](tools/strata-run.py) | 模式驱动：一条命令起短/长模式，带边界检查与日志 |
+| [`tools/watch-loop.py`](tools/watch-loop.py) | 双源循环监控：引擎日志（LOOP-RECOVERY / DEGEN-TOKEN / THINK-ONLY）+ 客户端会话文件（重复工具调用、逐字重复推理） |
+| [`tools/ab-modes.py`](tools/ab-modes.py) · [`tools/ab-prefill-fast.py`](tools/ab-prefill-fast.py) | A/B 测速：预热 + 交错 + 3 轮中位；prefill 用进度行 45 s 出结果 |
+
+---
+
+## 9. 其他
+
+### 9.1 局限（提 issue 前先读）
+
 - **decode 随上下文下降**：本卡 30 K 时 25 tok/s，79 K 时 18 tok/s。
+- **客户端 compaction 是前缀复用的硬断点**：被 compact 的对话要整体重读一次 prompt
+  （本机 37 K token 约 2 分钟）。所有做 token 前缀匹配的引擎都有这个问题。
 - **工具调用循环是客户端问题，不是采样器问题。** 一个把同一个 `read` 调用重复 77 次的模型，
-  温度、DRY、换量化都治不了 —— 需要客户端侧的守卫。`tools/watch-loop.py` 两类都能检测
-  （客户端会话文件里的重复工具调用、引擎日志里的逐字重复推理）。
+  温度、DRY、换量化都治不了 —— 需要客户端侧的守卫（`tools/watch-loop.py` 负责检测两类）。
 - **K-quant 在这里不是免费的**：`Q4_K*`/`Q5_K*`/`Q6_K` 的 prompt 路径需要
   `-DSTRATA_MMQ_KQUANTS=ON` 重编，而每个新增 kernel 实例都是急切加载的，在 4 GB 卡上会为
-  *每一个* 模型都吃掉显存。`Q2_K`/`Q3_K` 完全不在那个选项覆盖范围内。
+  *每一个* 模型都吃掉显存。`Q2_K`/`Q3_K` 完全不在那个选项覆盖内。
 - **单 GPU、单请求。** `--batch`、分层拆分、多卡都不与这些补丁组合（会话文件也会拒绝）。
 
-## 许可
+### 9.2 许可证
 
-MIT，与上游一致。`patches/` 是我们对 MIT 代码的改动；`LICENSE` 是上游的。
-精确基线以及改了什么见 `NOTICE.md`。
+**MIT**，与上游一致。`LICENSE` 是上游的原文；`patches/` 是我们对 MIT 代码的改动，
+同样以 MIT 授权。模型权重不在本仓库，遵循其自身许可（Apache-2.0）。
+
+本项目与 Strata 上游作者无隶属关系，也未被其背书。
+
+### 9.3 反馈
+
+开 issue 时请附上：`strata-run.py` 的完整启动参数、`--max-context` / KV / MTP 设置、
+以及 `results/` 里对应的日志尾部（时间戳能直接对齐）。
