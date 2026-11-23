@@ -1,7 +1,7 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 ; ============================================================================
-;  Strata 启动器（AutoHotkey v2，本机 v2.0.19 实测）
+;  TinyStrata 启动器（AutoHotkey v2，本机 v2.0.19 实测）
 ;  把 run-strata-qwen36.bat（短模式）与 run-strata-qwen36-long.bat（长模式）
 ;  合成一个界面：模式切换 / 参数交互 / 运行状态查看 / 可点击浏览器链接。
 ;
@@ -30,18 +30,41 @@
 ;  界面底部的「驱动输出」按钮可看；驱动跑完会自己检查日志尾部并在异常时弹提示。
 ; ============================================================================
 
-global DEV      := "D:\dev"
-global ROOT     := DEV . "\strata"
-global PY       := ROOT . "\.venv\Scripts\python.exe"
-global DRIVER   := DEV . "\tools\strata-run.py"
-global BASE_CFG := DEV . "\strata-qwen36-iq3s.json"
-global RESULTS  := DEV . "\results"
-global GUARD_PY := DEV . "\tools\strata-ram-guard.py"
-global INI      := DEV . "\strata-launcher.ini"
-global SELFLOG  := DEV . "\strata-launcher-selftest.txt"
-global SMOKELOG := DEV . "\strata-launcher-guismoke.txt"
-global SWITCHLOG := DEV . "\strata-launcher-switchtest.txt"
-global GUARD_LOG := RESULTS . "\strata-ram-guard.log"
+; ---- 路径：全部由 Locate() 在启动时算出来（便携化：不再硬编码 D:\dev）----
+; 优先级：环境变量 STRATA_HOME > 启动器旁边 ini 的 [ui] home > 启动器所在目录
+;         > 上溯 4 级父目录 > 老路径 D:\dev
+; 每个候选目录里的找法：<dir>\engine*\strata.exe > <dir>\strata.exe
+;                     > <dir>\*\strata.exe > <dir>\*\*\strata.exe
+global DEV      := ""    ; HOME：配置/日志/会话所在目录
+global ROOT     := ""    ; 引擎检出目录（含 serve\server.py）
+global EXE      := ""    ; strata.exe 的实际位置
+global SERVER_PY := ""   ; serve\server.py（OpenAI 兼容层；引擎本身没有 HTTP 服务）
+global PY       := ""
+global DRIVER   := ""
+global BASE_CFG := ""
+global RESULTS  := ""
+global SESSIONS := ""
+global GUARD_PY := ""
+global INI      := ""
+global SELFLOG  := ""
+global SMOKELOG := ""
+global SWITCHLOG := ""
+global I18NLOG  := ""
+global FINDLOG  := ""
+global GUARD_LOG := ""
+global TPL_DIR  := ""
+global gLocated := false  ; Locate() 有没有真的找到 strata.exe
+global gLocateHow := ""   ; 从哪个目录找到的（状态行要显示）
+global gLang := "zh"            ; "zh" | "en"（InitLang() 里定）
+global EN := Map()
+global ENKeys := []
+Locate()
+try {
+    InitLang()
+} catch as e {
+    FileAppend("i18n init failed: " . e.Message . " @" . e.Line . " (" . e.What . ")" . chr(10), "D:\dev\scratch\i18n-err.txt", "UTF-8")
+    gLang := "zh"
+}
 global RAM_ABORT_MB := 500        ; 与驱动内护栏同阈值：余量低于它就杀引擎
 global MODEL_NEED_MB := 13000     ; 引擎要吞 ~12 GiB 专家进内存
 global VRAM_WARN_MIB := 400       ; 显存"实际已占用"超过它才提醒（不按有没有进程）
@@ -77,9 +100,664 @@ global S_BASE_H := 26
 ; 所以：设置用 .Text，读取用 .Text；.Value 只在 Radio/CheckBox 上用 0/1）
 global KV_LIST := ["k8v4", "q4_0", "int8", "fp16"]
 ; MTP 选项按模式：短模式 = gpu（专家在显存）/ off；长模式 = cpu（专家在主机内存，省 312 MiB）/ off
-global TPL_DIR := "D:\dev\templates"   ; chat 模板默认目录（froggeric 等放这里）
+global TPL_DIR := ""   ; chat 模板默认目录（Locate() 里按 HOME\templates 定）
 global MTP_LIST_SHORT := ["gpu", "off"]
 global MTP_LIST_LONG := ["cpu", "off"]   ; 长模式只有 cpu/off：专家全上 GPU 会装不下（80K 上下文放不下 312 MiB）
+; ---------------------------------------------------------------- 0. 便携化定位
+; 找到 strata.exe 在哪，然后把 DEV/ROOT/PY/DRIVER/... 全部派生出来。
+; 找不到就退回老布局（D:\dev\strata\engine-cuda12），让界面还能建出来，Preflight 会报缺件。
+Locate() {
+    global DEV, ROOT, EXE, SERVER_PY, PY, DRIVER, BASE_CFG, RESULTS, SESSIONS
+    global GUARD_PY, INI, SELFLOG, SMOKELOG, SWITCHLOG, I18NLOG, FINDLOG, GUARD_LOG, TPL_DIR
+    global gLocated, gLocateHow
+
+    cands := []
+    if (v := EnvGet("STRATA_HOME")) && v != ""
+        cands.Push(v)                        ; 1) 环境变量
+    iniNear := A_ScriptDir . "\strata-launcher.ini"
+    if FileExist(iniNear) {
+        try {
+            h := IniRead(iniNear, "ui", "home", "")
+            if (h != "")
+                cands.Push(h)                ; 2) 上次「浏览…」选过的
+        }
+    }
+    d := A_ScriptDir
+    loop 5 {                                 ; 3) 启动器所在目录 + 上溯 4 级
+        cands.Push(d)
+        p := ParentDir(d)
+        if (p = "" || p = d)
+            break
+        d := p
+    }
+    cands.Push("D:\dev")                     ; 4) 老路径，保证本机行为不变
+
+    hit := "", how := ""
+    for dir in cands {
+        if (dir = "")
+            continue
+        e := FindEngineIn(dir)
+        if (e != "") {
+            hit := e, how := dir
+            break
+        }
+    }
+
+    if (hit = "") {
+        gLocated := false, gLocateHow := ""
+        DEV := "D:\dev", ROOT := DEV . "\strata"
+        EXE := ROOT . "\engine-cuda12\strata.exe"
+        SERVER_PY := ROOT . "\serve\server.py"
+    } else {
+        gLocated := true, gLocateHow := how
+        r := ResolveEngineRoot(hit)
+        EXE := r.exe, ROOT := r.root, DEV := r.home
+        SERVER_PY := ROOT . "\serve\server.py"
+    }
+
+    PY := FirstFile(ROOT . "\.venv\Scripts\python.exe", DEV . "\.venv\Scripts\python.exe",
+                    ROOT . "\python\python.exe", DEV . "\python\python.exe")
+    if (PY = "")
+        PY := OnPath("python.exe")
+    DRIVER := FirstFile(DEV . "\tools\strata-run.py", ROOT . "\tools\strata-run.py",
+                        A_ScriptDir . "\tools\strata-run.py")
+    BASE_CFG := FirstFile(DEV . "\strata-qwen36-iq3s.json", ROOT . "\strata-qwen36-iq3s.json",
+                          A_ScriptDir . "\strata-qwen36-iq3s.json")
+    if (BASE_CFG = "")
+        BASE_CFG := FirstGlob(DEV . "\configs\*.json", ROOT . "\configs\*.json",
+                              A_ScriptDir . "\configs\*.json")
+    RESULTS := DEV . "\results"
+    SESSIONS := DEV . "\sessions"
+    GUARD_PY := FirstFile(DEV . "\tools\strata-ram-guard.py", ROOT . "\tools\strata-ram-guard.py")
+    INI := DEV . "\strata-launcher.ini"
+    SELFLOG := DEV . "\strata-launcher-selftest.txt"
+    SMOKELOG := DEV . "\strata-launcher-guismoke.txt"
+    SWITCHLOG := DEV . "\strata-launcher-switchtest.txt"
+    I18NLOG := DEV . "\strata-launcher-i18ntest.txt"
+    FINDLOG := DEV . "\strata-launcher-findtest.txt"
+    GUARD_LOG := RESULTS . "\strata-ram-guard.log"
+    TPL_DIR := DirExist(DEV . "\templates") ? DEV . "\templates" : ROOT . "\templates"
+}
+
+; a\b\c -> a\b（盘根不再上溯；已到顶就返回原值）
+ParentDir(p) {
+    p := RTrim(p, "\/")
+    if (p = "" || RegExMatch(p, "^[A-Za-z]:$"))
+        return p
+    q := RegExReplace(p, "\\[^\\]*$", "")
+    return (q = "") ? p : q
+}
+
+; 在一个目录里找引擎。不是"第一个命中"就返回 —— 而是**收集全部候选再打分**：
+; 本机 D:\dev 下就有 backup-2026-10-12\engine-cuda12-0.1.41\strata.exe 这种归档，
+; 按字母序它会抢在 strata\engine-cuda12\ 前面。
+FindEngineIn(dir) {
+    exes := FindEnginesIn(dir)
+    best := "", bestScore := -1000000
+    for e in exes {
+        sc := ScoreEngine(e)
+        if (sc > bestScore)
+            best := e, bestScore := sc
+    }
+    return best
+}
+
+; 收集一个目录里所有候选（去重）
+FindEnginesIn(dir) {
+    out := []
+    if (dir = "" || !DirExist(dir))
+        return out
+    patterns := [dir . "\strata.exe", dir . "\engine*\strata.exe",
+                 dir . "\*\strata.exe", dir . "\*\engine*\strata.exe"]
+    for pat in patterns {
+        loop files, pat {
+            f := A_LoopFileFullPath
+            if !HasVal(out, f)
+                out.Push(f)
+        }
+    }
+    if !RegExMatch(RTrim(dir, "\/"), "^[A-Za-z]:$")          ; 盘根不做 DFS
+        out := MergeUniq(out, FindEnginesDeep(dir, 1, 3, A_TickCount + 3000))
+    return out
+}
+
+; 有限深度遍历，跳过备份/缓存这类大而无用的目录
+FindEnginesDeep(dir, depth, maxDepth, deadline) {
+    out := []
+    if (depth > maxDepth || A_TickCount > deadline)
+        return out
+    loop files, dir . "\*", "D" {
+        if (A_TickCount > deadline)
+            return out
+        sub := A_LoopFileFullPath
+        n := RegExReplace(sub, "^.*\\", "")
+        if RegExMatch(n, "i)^(node_modules|__pycache__|\.git.*|\.venv|\.cache|dist|tmp|temp)$")
+            continue
+        if FileExist(sub . "\strata.exe")
+            out.Push(sub . "\strata.exe")
+        out := MergeUniq(out, FindEnginesDeep(sub, depth + 1, maxDepth, deadline))
+    }
+    return out
+}
+
+HasVal(arr, v) {
+    for x in arr
+        if (x = v)
+            return true
+    return false
+}
+
+MergeUniq(a, b) {
+    for x in b
+        if !HasVal(a, x)
+            a.Push(x)
+    return a
+}
+
+; 候选打分：正经检出 > 便携 > 归档/备份；浅的优先
+ScoreEngine(exe) {
+    exeDir := ParentDir(exe)
+    root := ResolveEngineRoot(exe).root
+    nm := RegExReplace(exeDir, "^.*\\", "")
+    s := 0
+    if FileExist(root . "\serve\server.py")
+        s += 100                                   ; 有 Python 服务层 = 真检出
+    if (nm = "engine-cuda12")
+        s += 50                                    ; 规范目录名
+    if FileExist(root . "\setup.py")
+        s += 20
+    for comp in StrSplit(exe, "\") {                 ; 路径里任一目录名像归档 → 扣分
+        lc := StrLower(comp)
+        if (SubStr(lc, 1, 6) = "backup" || SubStr(lc, 1, 3) = "old"
+            || lc = "tmp" || lc = "temp" || lc = "dist" || lc = "obsolete")
+            s -= 200
+    }
+    if InStr(nm, "-0.")                                ; engine-cuda12-0.1.41 这类版本快照
+        s -= 60                                    ; engine-cuda12-0.1.41 这类版本快照
+    s -= StrSplit(exe, "\").Length                 ; 同等条件下浅的赢
+    return s
+}
+
+; 从 exe 路径反推 ROOT（项目根）与 HOME（配置/日志目录）
+ResolveEngineRoot(exe) {
+    parent := ParentDir(exe)
+    name := RegExReplace(parent, "^.*\\", "")
+    root := (SubStr(name, 1, 6) = "engine") ? ParentDir(parent) : parent
+    home := root
+    up := ParentDir(root)
+    if (up != "" && (FileExist(up . "\tools\strata-run.py") || DirExist(up . "\results")))
+        home := up
+    return {exe: exe, root: root, home: home}
+}
+
+FirstFile(paths*) {
+    for p in paths {
+        if (p != "" && FileExist(p))
+            return p
+    }
+    return ""
+}
+
+FirstGlob(patterns*) {
+    for p in patterns {
+        loop files, p
+            return A_LoopFileFullPath
+    }
+    return ""
+}
+
+OnPath(exeName) {
+    for d in StrSplit(EnvGet("PATH"), ";") {
+        if (d = "")
+            continue
+        if FileExist(d . "\" . exeName)
+            return d . "\" . exeName
+    }
+    return ""
+}
+
+; ---------------------------------------------------------------- 0c. 语言（中英）
+; 做法：EN 是「中文原文 -> 英文」映射，Tf() 按 key 长度从长到短做字串替换。
+; 没收录的串原样返回 —— 漏译只是不翻译，绝不会报错或吃字符。
+LangFill(e) {
+    e["TinyStrata 启动器"] := "TinyStrata Launcher"
+    e["TinyStrata 启动器 · 简洁模式"] := "TinyStrata Launcher - Simple"
+    e["TinyStrata 启动器 - 简洁模式"] := "TinyStrata Launcher - Simple"
+    e["TinyStrata 启动器 - 停止"] := "TinyStrata Launcher - Stop"
+    e["TinyStrata 启动器 - 重启"] := "TinyStrata Launcher - Restart"
+    e["TinyStrata 启动器 - 预检失败"] := "TinyStrata Launcher - Preflight failed"
+    e["TinyStrata 启动器"] := "TinyStrata Launcher"
+    e["模式（切换按预设覆盖 ctx/kv/resident/mtp/reserve/preserve 等模式相关参数）"] := "Mode (switching applies a preset: ctx/kv/resident/mtp/reserve/preserve ...)"
+    e["参数（改完直接点启动；字段名与驱动一致）"] := "Parameters (edit, then Start; names match the driver)"
+    e["采样（留空 = 该键不写；thinking=off → reasoning_effort=none）"] := "Sampling (blank = key omitted; thinking=off -> reasoning_effort=none)"
+    e["浏览器链接（点击用默认浏览器打开；端口跟随上面的 port 字段）"] := "Browser links (click to open; the port follows the field above)"
+    e["运行状态（每 5 秒刷新）"] := "Status (refreshed every 5 s)"
+    e["日志与配置"] := "Logs and config"
+    e["服务端日志尾部（自动刷新；自动换行；可滚动）"] := "Server log tail (auto-refresh, wrapped, scrollable)"
+    e["参数"] := "Parameters"
+    e["短模式（快）"] := "Short (fast)"
+    e["长模式（长上下文）"] := "Long (big context)"
+    e["短 = 20K ctx / k8v4 / MTP 开（--spec 3，专家在 GPU）/ KV 全常驻 / reserve 64（上限 39936）"] := "short = 20K ctx / k8v4 / MTP on (--spec 3, experts on GPU) / KV fully resident / reserve 64 (ceiling 39936)"
+    e["长 = 80K ctx / KV 全常驻 / reserve 64 / MTP 开（--spec 2，专家在主机内存）/ 上限 81920（实测 65K prompt decode ~19-21 tok/s）"] := "long = 80K ctx / KV fully resident / reserve 64 / MTP on (--spec 2, experts in host RAM) / ceiling 81920 (65K prompt: decode ~19-21 tok/s)"
+    e["短：20K 上下文 / MTP 开　长：64K 上下文、KV 全常驻 / MTP 关（实测更快）"] := "short: 20K ctx, MTP on;  long: big ctx, KV fully resident"
+    e["上下文长度"] := "Context length"
+    e["启用思考"] := "Thinking"
+    e["接口地址"] := "Base URL"
+    e["打开网页聊天"] := "Open web chat"
+    e["刷新"] := "Refresh"
+    e["复制"] := "Copy"
+    e["已切到"] := "Switched to "
+    e["切到"] := "Switch to "
+    e["专业模式"] := "Pro"
+    e["简洁模式"] := "Simple"
+    e["短"] := "short"
+    e["长"] := "long"
+    e["启动"] := "Start"
+    e["重启"] := "Restart"
+    e["停止"] := "Stop"
+    e["预览(--check)"] := "Preview (--check)"
+    e["刷新状态"] := "Refresh"
+    e["打开日志目录"] := "Open logs"
+    e["保存为默认"] := "Save defaults"
+    e["简洁模式 →"] := "Simple view ->"
+    e["专业模式 →"] := "Pro view ->"
+    e["引擎日志"] := "Engine log"
+    e["服务端日志"] := "Server log"
+    e["驱动输出"] := "Driver output"
+    e["护栏日志"] := "Guard log"
+    e["运行配置 json"] := "Run config json"
+    e["模板配置"] := "Template config"
+    e["自检报告"] := "Selftest report"
+    e["选择…"] := "Browse..."
+    e["GGUF…"] := "GGUF..."
+    e["mmproj…"] := "mmproj..."
+    e["清空"] := "Clear"
+    e["模型"] := "Model"
+    e["模板"] := "Template"
+    e["端口"] := "port"
+    e["运行状态: -"] := "Status: -"
+    e["进程: -"] := "Processes: -"
+    e["端口: -"] := "Port: -"
+    e["内存: -"] := "RAM: -"
+    e["显存: -"] := "VRAM: -"
+    e["文件自检: -"] := "Files: -"
+    e["最近动作: -"] := "Last action: -"
+    e["运行状态"] := "Status"
+    e["文件自检"] := "Files"
+    e["最近动作"] := "Last action"
+    e["边界检查: —"] := "Bounds: -"
+    e["边界检查: "] := "Bounds: "
+    e["运行中（引擎已加载）"] := "running (engine loaded)"
+    e["加载中…"] := "loading..."
+    e["未运行"] := "not running"
+    e["异常"] := "error"
+    e["留空=用 pack 自带"] := "blank = pack default"
+    e["off=关 / cpu=不占显存 / gpu=占~1.2GB"] := "off / cpu = no VRAM / gpu = ~1.2 GB"
+    e["cpu=不占显存（推荐）"] := "cpu = no VRAM"
+    e["对应这些 --xxx 参数（写进 sampling 块）；dry = 重复序列惩罚，空=用模板值 1.5，0=关"] := "these map to --xxx flags in the sampling block; dry = repeated-sequence penalty, blank = template 1.5, 0 = off"
+    e["图片"] := "Image"
+    e["图tok"] := "img-tok"
+    e["浏览器"] := "Browser"
+    e["已清空 GGUF/mmproj 覆盖"] := "Cleared the GGUF/mmproj overrides"
+    e["已发起启动"] := "Launch requested"
+    e["已发起预览 --check"] := "Preview (--check) requested"
+    e["已保存为默认："] := "Saved as default: "
+    e["已保存为默认（"] := "Saved as default ("
+    e["已载入上次设置（"] := "Loaded last settings ("
+    e["保存失败: "] := "Save failed: "
+    e["保存失败："] := "Save failed: "
+    e["模板: "] := "Template: "
+    e["模式 ctx="] := "mode ctx="
+    e["用户取消了启动（提醒未通过）"] := "Launch cancelled at the warnings prompt"
+    e["没有发现运行中的 Strata 进程（引擎 / 服务端 / 护栏 / 驱动 / 启动 cmd 都没有）。"] := "No Strata process found (engine / server / guard / driver / launcher cmd)."
+    e["预览完成（--check）：运行配置已重写，引擎没启动"] := "Preview done (--check): run config rewritten, engine not started"
+    e["驱动已正常退出（服务端 code=0）"] := "Driver exited normally (server code=0)"
+    e["驱动已退出，但没找到输出日志： "] := "Driver exited but its log was not found: "
+    e["驱动异常退出"] := "Driver exited with an error"
+    e["（重启后生效，缓存会失效）"] := " (takes effect after restart; cache is dropped)"
+    e["—— 见「驱动输出」"] := " - see 'Driver output'"
+    e["个进程，成功 "] := " process(es), killed "
+    e["个进程，等待释放后重新启动…"] := " process(es), waiting for release then restarting..."
+    e["停止：请求 "] := "Stop: asked "
+    e["重启：已停 "] := "Restart: stopped "
+    e["，日志："] := ", log: "
+    e["找不到：`n"] := "Not found:`n"
+    e["无法启动：`n"] := "Cannot start:`n"
+    e["界面启动失败：`n"] := "UI failed to start:`n"
+    e["`n位置："] := "`n  at "
+    e[" @行 "] := " line "
+    e["`n`n命令行：`n"] := "`n`nCommand line:`n"
+    e["`n`n最后几行：`n"] := "`n`nLast lines:`n"
+    e["`n`n继续？"] := "`n`nContinue?"
+    e["是否停止Strata引擎及相关进程"] := "Stop the Strata engine and related processes?"
+    e["TinyStrata 启动器 · 简洁模式"] := "TinyStrata Launcher - Simple"
+    e["专业模式 →"] := "Pro view ->"
+    e["模式"] := "Mode"
+    e["参数"] := "Parameters"
+    e["端口"] := "Port"
+    e["图片"] := "Image"
+    e["图tok"] := "img-tok"
+    e["上下文长度"] := "Context length"
+    e["启用思考"] := "Thinking"
+    e["复制"] := "Copy"
+    e["刷新"] := "Refresh"
+    e["打开网页聊天"] := "Open web chat"
+    e["接口地址"] := "Base URL"
+    e["API 监控"] := "API monitor"
+    e["网页聊天"] := "Web chat"
+    e["preserve-thinking"] := "preserve-thinking"
+    e["运行中（引擎已加载）"] := "running (engine loaded)"
+    e["（引擎在起，端口 "] := " (engine starting, port "
+    e[" 还没就绪"] := " not ready yet"
+    e["：进程还在但端口 "] := ": process alive but port "
+    e[" 无响应，日志也停了"] := " is unresponsive and the log stopped"
+    e["（端口 "] := " (port "
+    e[" 无响应）"] := " unresponsive)"
+    e["进程还在但端口 "] := "process alive but port "
+    e["引擎在起，端口 "] := "engine starting, port "
+    e["异常："] := "error: "
+    e["运行中"] := "running"
+    e["无"] := "none"
+    e["无响应"] := "no response"
+    e["长"] := "long"
+    e["短"] := "short"
+    e["模式"] := "mode"
+    e["开"] := "on"
+    e["关"] := "off"
+    e["进程: 引擎 "] := "Processes: engine "
+    e[" · 服务端 "] := " · server "
+    e[" · 驱动 "] := " · driver "
+    e[" · 护栏 "] := " · guard "
+    e[" · 监控 "] := " · monitor "
+    e["内存: 空闲 "] := "RAM free: "
+    e[" GiB / 共 "] := " GiB of "
+    e[" GiB（护栏阈值 <"] := " GiB (guard kills below "
+    e[" MB 杀引擎；模型要 ~12 GiB）"] := " MB; the model needs ~12 GiB)"
+    e["显存: "] := "VRAM: "
+    e["读不到（nvidia-smi 不可用）"] := "unavailable (nvidia-smi)"
+    e["已用 "] := "used "
+    e["文件自检: "] := "Files: "
+    e["缺 "] := "missing "
+    e["、"] := ", "
+    e["齐全"] := "OK"
+    e["模式日志 "] := "mode log "
+    e["（本次实例）"] := " (this instance)"
+    e[" · 另有 "] := " · also "
+    e["（超过 "] := " (above "
+    e[" MiB 阈值 → 启动前会提醒）"] := " MiB threshold -> warn before start)"
+    e[" · 占用: "] := " · held by: "
+    e["（低于 "] := " (below "
+    e[" MiB 阈值 → 启动前不提醒）"] := " MiB threshold -> no warning)"
+    e["长模式"] := "long mode"
+    e["短模式"] := "short mode"
+    e[" / resident "] := " / resident "
+    e[" 这个组合本机未实测（短模式 k8v4+MTP 到 39936、长模式 k8v4 全常驻到 81920）"] := " is not measured on this machine (short k8v4+MTP up to 39936, long k8v4 resident up to 81920)"
+    e[" · 实测边界（"] := " · measured bounds ("
+    e["）"] := ")"
+    e[" 能启动 / "] := " starts / "
+    e[" 被拒  ->  当前 ctx "] := " refused  ->  current ctx "
+    e["可启动"] := "ok"
+    e["超过边界，引擎很可能拒绝"] := "over the bound; the engine will likely refuse"
+    e["），改完点「启动」"] := "), edit then press Start"
+    return e
+}
+
+; 把文本里已知的中文片段换成英文（只在 en 模式生效）
+Tf(s) {
+    global gLang, EN, ENKeys
+    if (gLang != "en" || s = "")
+        return s
+    s := String(s)
+    for k in ENKeys
+        if InStr(s, k)
+            s := StrReplace(s, k, EN[k])
+    return s
+}
+
+; 遍历一个 Gui 的所有控件，翻译 Text（按钮/标签/分组框/单选/复选）
+TranslateGui(g) {
+    if (!IsObject(g))
+        return 0
+    n := 0
+    for c in g {
+        try {
+            t := c.Text
+            if (t != "" && (t2 := Tf(t)) != t) {
+                c.Text := t2
+                n++
+            }
+        }
+    }
+    return n
+}
+
+; 语言来源：命令行 > INI > 系统 UI 语言（主语言 0x04 = 中文，其余按英文）
+DetectLang() {
+    global INI
+    if HasArg("--en")
+        return "en"
+    if HasArg("--zh")
+        return "zh"
+    if (INI != "" && FileExist(INI)) {
+        try {
+            v := IniRead(INI, "ui", "lang", "")
+            if (v = "zh" || v = "en")
+                return v
+        }
+    }
+    try {
+        lcid := DllCall("GetUserDefaultUILanguage", "UShort")
+        return ((lcid & 0x3FF) = 0x04) ? "zh" : "en"
+    }
+    return "zh"
+}
+
+InitLang() {
+    global gLang, EN, ENKeys
+    EN := LangFill(Map())
+    ENKeys := []
+    for k, v in EN
+        ENKeys.Push(k)
+    ; 长 key 优先，避免短片段先命中把长串拆坏
+    loop ENKeys.Length - 1 {
+        i := A_Index
+        while (i >= 1 && StrLen(ENKeys[i]) < StrLen(ENKeys[i + 1])) {
+            tmp := ENKeys[i], ENKeys[i] := ENKeys[i + 1], ENKeys[i + 1] := tmp
+            i--
+        }
+    }
+    gLang := DetectLang()
+    return gLang
+}
+
+SaveLang(v) {
+    global INI
+    try {
+        if (INI != "")
+            IniWrite(v, INI, "ui", "lang")
+    }
+}
+
+; 语言菜单（两个窗口共用一份定义）：中文 / English / 跟随系统
+AddLangMenu(g) {
+    m := Menu()
+    m.Add("简体中文", (*) => SetLang("zh"))
+    m.Add("English", (*) => SetLang("en"))
+    m.Add()
+    m.Add("跟随系统 / Auto", (*) => SetLang(""))
+    bar := MenuBar()
+    bar.Add(Tf("语言 / Language"), m)
+    g.MenuBar := bar
+}
+
+; 切换语言：存 INI，然后两个窗口一起重建（参数集合从界面上收集，不丢设置）
+SetLang(v) {
+    global gLang
+    new := (v = "") ? DetectLang() : v
+    if (new = gLang)
+        return
+    gLang := new
+    SaveLang(new)
+    RebuildUi()
+}
+
+RebuildUi() {
+    global gPro, gSimple, gUiMode
+    cur := CollectCurrent()
+    mode := gUiMode
+    try gPro.Destroy()
+    try gSimple.Destroy()
+    gPro := BuildGui()
+    gSimple := BuildSimpleGui()
+    gUiMode := mode
+    SetCurrent(cur)
+    UpdateDerived()
+    if (gUiMode = "simple")
+        gSimple.Show("w" . SIMPLE_W . " h" . SIMPLE_H)
+    else
+        gPro.Show("w" . PRO_W . " h" . PRO_H)
+    RefreshStatus()
+}
+
+; 语言自检：EN 模式下遍历两个窗口的所有控件，断言不含中文；再切回 zh 断言还原
+I18ntest() {
+    global gLang, gPro, gSimple, gUiMode, I18NLOG
+
+    gLang := "en"
+    gPro := BuildGui()
+    gSimple := BuildSimpleGui()
+    rep := [], ok := 0, fail := 0
+
+    cjk := 0, samples := []
+    for g in [gPro, gSimple] {
+        for c in g {
+            try {
+                t := c.Text
+                if (t = "")
+                    continue
+                if RegExMatch(t, "[\x{4e00}-\x{9fff}]") {
+                    cjk++
+                    if (samples.Length < 12)
+                        samples.Push(t)
+                }
+            }
+        }
+    }
+    FT(rep, "EN 模式下控件不含中文（残留 " . cjk . " 处）", cjk = 0, Join(samples, " | "))
+
+    ; 抽检动态文案
+    checks := [["启动", "Start"], ["长模式（长上下文）", "Long (big context)"],
+               ["运行状态: -", "Status: -"], ["停止", "Stop"], ["预览(--check)", "Preview (--check)"]]
+    bad := []
+    for c in checks
+        if (Tf(c[1]) != c[2])
+            bad.Push(c[1] . "->" . Tf(c[1]))
+    FT(rep, "关键文案翻译正确", bad.Length = 0, Join(bad, " | "))
+
+    ; 未收录的串原样返回（不会吃字符）
+    FT(rep, "未收录串原样返回", Tf("未收录的测试串") = "未收录的测试串", Tf("未收录的测试串"))
+    ; 英文串不被二次破坏
+    FT(rep, "英文串不被改写", Tf("Already English") = "Already English", Tf("Already English"))
+
+    ; 切回中文：控件应重新出现中文
+    gLang := "zh"
+    try gPro.Destroy()
+    try gSimple.Destroy()
+    gPro := BuildGui()
+    gSimple := BuildGui()   ; 只为数控件，稍后销毁
+    zh := 0
+    for c in gPro {
+        try {
+            t := c.Text
+            if (t != "" && RegExMatch(t, "[\x{4e00}-\x{9fff}]"))
+                zh++
+        }
+    }
+    FT(rep, "zh 模式下中文回来了（" . zh . " 个控件）", zh > 20, "")
+    try gPro.Destroy()
+    try gSimple.Destroy()
+
+    ok := 0, fail := 0
+    for line in rep
+        (SubStr(line, 1, 6) = "[ OK ]") ? ok++ : fail++
+    if FileExist(I18NLOG)
+        FileDelete(I18NLOG)
+    for line in rep
+        FileAppend(line . "`n", I18NLOG, "UTF-8")
+    FileAppend("`n-- " . ok . " OK / " . fail . " FAIL`n  结果见：" . I18NLOG . "`n", I18NLOG, "UTF-8")
+    ExitApp(fail = 0 ? 0 : 1)
+}
+
+; ---------------------------------------------------------------- 0b. 自检：定位
+; 造假目录树，验证 FindEngineIn / ResolveEngineRoot 的判断，不碰全局变量。
+; （AHK v2 不支持嵌套函数，所以判定逻辑抽成 FT()）
+FT(rep, label, cond, detail := "") {
+    rep.Push((cond ? "[ OK ] " : "[FAIL] ") . label . (detail != "" ? "  :: " . detail : ""))
+    return cond ? 1 : 0
+}
+
+Findtest() {
+    global
+    t := A_Temp . "\strata-findtest"
+    if DirExist(t)
+        DirDelete(t, true)
+    rep := []
+    ok := 0, fail := 0
+
+    ; 1) 检出布局：<t>\checkout\strata\engine-cuda12\strata.exe + tools/results
+    DirCreate(t . "\checkout\strata\engine-cuda12")
+    FileAppend("", t . "\checkout\strata\engine-cuda12\strata.exe")
+    DirCreate(t . "\checkout\tools")
+    DirCreate(t . "\checkout\results")
+    FileAppend("", t . "\checkout\tools\strata-run.py")
+    e := FindEngineIn(t . "\checkout")
+    FT(rep, "检出布局能找到 exe", e != "", e)
+    r := ResolveEngineRoot(e)
+    FT(rep, "检出布局 ROOT = ...\strata", r.root = t . "\checkout\strata", r.root)
+    FT(rep, "检出布局 HOME = ...\checkout", r.home = t . "\checkout", r.home)
+
+    ; 2) 便携布局：strata.exe 就在根目录，旁边有 serve
+    DirCreate(t . "\portable\serve")
+    FileAppend("", t . "\portable\strata.exe")
+    FileAppend("", t . "\portable\serve\server.py")
+    e2 := FindEngineIn(t . "\portable")
+    FT(rep, "便携布局能找到 exe", e2 = t . "\portable\strata.exe", e2)
+    r2 := ResolveEngineRoot(e2)
+    FT(rep, "便携布局 ROOT = 该目录", r2.root = t . "\portable", r2.root)
+    FT(rep, "便携布局 HOME = ROOT（无 tools/results）", r2.home = t . "\portable", r2.home)
+
+    ; 3) exe 在两层子目录里
+    DirCreate(t . "\deep\a\b")
+    FileAppend("", t . "\deep\a\b\strata.exe")
+    FT(rep, "两层子目录能找到", FindEngineIn(t . "\deep") = t . "\deep\a\b\strata.exe")
+
+    ; 4) 空目录不误命中
+    DirCreate(t . "\empty")
+    FT(rep, "空目录返回空", FindEngineIn(t . "\empty") = "")
+
+    ; 5) ParentDir 边界
+    FT(rep, "ParentDir 普通", ParentDir("D:\a\b\c") = "D:\a\b", ParentDir("D:\a\b\c"))
+    FT(rep, "ParentDir 盘根", ParentDir("D:\a") = "D:", ParentDir("D:\a"))
+    FT(rep, "ParentDir 只在盘符", ParentDir("D:") = "D:", ParentDir("D:"))
+
+    ; 6) 真实环境：本机应该能定位到引擎
+    FT(rep, "本机定位到 strata.exe", gLocated, EXE)
+    FT(rep, "定位到的 exe 真的存在", FileExist(EXE), EXE)
+    FT(rep, "EXE 文件名正确", SubStr(StrLower(EXE), -10) = "strata.exe", EXE)
+    FT(rep, "定位来源非空", gLocateHow != "", gLocateHow)
+
+    DirDelete(t, true)
+    ok := 0, fail := 0
+    for line in rep
+        (SubStr(line, 1, 6) = "[ OK ]") ? ok++ : fail++
+    if FileExist(FINDLOG)
+        FileDelete(FINDLOG)
+    for line in rep
+        FileAppend(line . "`n", FINDLOG, "UTF-8")
+    FileAppend("`n-- " . ok . " OK / " . fail . " FAIL`n  结果见：" . FINDLOG . "`n", FINDLOG, "UTF-8")
+    ExitApp(fail = 0 ? 0 : 1)
+}
+
 ; 界面值 -> 引擎参数
 ; 切模式时 MTP 下拉框的选项要换（短 = gpu/off，长 = cpu/off）。
 ; AHK v2 的 DDL 没有 GetCount，所以自己记一份当前列表（gMtpList）。
@@ -302,12 +980,12 @@ BoundaryExceeded(o) {
 BoundaryText(o) {
     o := Normalize(o)
     b := Boundary(o.kv, o.resident, o.mtp, Prop(o, "mtp_cpu_moe", "off"))
-    mode := (o.mode = "long" ? "长模式" : "短模式")
+    mode := (o.mode = "long" ? Tf("长模式") : Tf("短模式"))
     if !b.measured
-        return mode . " · " . o.kv . " / resident " . o.resident . " / mtp " . o.mtp
-            . " 这个组合本机未实测（短模式 k8v4+MTP 到 39936、长模式 k8v4 全常驻到 81920）"
-    head := mode . " · 实测边界（" . b.key . "）" . b.ok . " 能启动 / " . b.no . " 被拒  ->  当前 ctx " . o.ctx . "  "
-    return o.ctx <= b.ok ? head . "可启动" : head . "超过边界，引擎很可能拒绝"
+        return mode . " · " . o.kv . Tf(" / resident ") . o.resident . " / mtp " . o.mtp
+            . Tf(" 这个组合本机未实测（短模式 k8v4+MTP 到 39936、长模式 k8v4 全常驻到 81920）")
+    head := mode . Tf(" · 实测边界（") . b.key . Tf("）") . b.ok . Tf(" 能启动 / ") . b.no . Tf(" 被拒  ->  当前 ctx ") . o.ctx . "  "
+    return o.ctx <= b.ok ? head . Tf("可启动") : head . Tf("超过边界，引擎很可能拒绝")
 }
 
 ; ------------------------------------------- 2. 参数校验 / 命令行构造
@@ -693,21 +1371,25 @@ ElapsedText() {
 
 StateLine(st) {
     if (st.state = "running")
-        return {text: "运行状态: ● 运行中（引擎已加载）", color: "008000"}
+        return {text: Tf("运行状态: ") . "● " . Tf("运行中（引擎已加载）"), color: "008000"}
     if (st.state = "loading")
-        return {text: "运行状态: ◐ 加载中…（引擎在起，端口 " . st.port . " 还没就绪"
+        return {text: Tf("运行状态: ") . "◐ " . Tf("加载中…") . "（" . Tf("引擎在起，端口 ") . st.port . Tf(" 还没就绪")
             . (ElapsedText() != "" ? " · " . ElapsedText() : "") . "）", color: "B8860B"}
     if (st.state = "zombie")
-        return {text: "运行状态: ✕ 异常：进程还在但端口 " . st.port . " 无响应，日志也停了（看服务端日志尾部）", color: "C00000"}
-    return {text: "运行状态: ○ 未运行（端口 " . st.port . " 无响应）", color: "606060"}
+        return {text: Tf("运行状态: ") . "✕ " . Tf("异常") . "：" . Tf("进程还在但端口 ") . st.port . Tf(" 无响应，日志也停了"), color: "C00000"}
+    return {text: Tf("运行状态: ") . "○ " . Tf("未运行") . "（" . Tf("端口 ") . st.port . Tf(" 无响应）"), color: "606060"}
 }
 
 ; ------------------------------------------------- 4. 预检
 Preflight(o, addCheck) {
     o := Normalize(o)
     problems := [], warns := []
+    if !FileExist(EXE)
+        problems.Push("引擎缺失: " . EXE . "  （把 strata.exe 放到启动器旁边，或设 STRATA_HOME）")
+    if !FileExist(SERVER_PY)
+        problems.Push("服务层缺失: " . SERVER_PY . "  （引擎本身没有 HTTP 服务，serve\ 目录必须存在）")
     if !FileExist(PY)
-        problems.Push("venv python 缺失: " . PY . "  （先在 " . ROOT . " 跑一次 START-HERE.bat）")
+        problems.Push("python 缺失: " . PY . "  （检出布局需先在 " . ROOT . " 跑一次 START-HERE.bat；便携包需带 python\python.exe）")
     if !FileExist(DRIVER)
         problems.Push("驱动缺失: " . DRIVER)
     if !FileExist(BASE_CFG)
@@ -753,8 +1435,12 @@ Preflight(o, addCheck) {
 ; 预检的无弹窗版（自检用：只看文件与数字参数）
 PreflightNoDlg(o) {
     problems := []
+    if !FileExist(EXE)
+        problems.Push("引擎")
+    if !FileExist(SERVER_PY)
+        problems.Push("服务层")
     if !FileExist(PY)
-        problems.Push("venv python")
+        problems.Push("python")
     if !FileExist(DRIVER)
         problems.Push("驱动")
     if !FileExist(BASE_CFG)
@@ -771,14 +1457,14 @@ DoLaunch(addCheck) {
     o := CollectCurrent()
     pf := Preflight(o, addCheck)
     if !pf.ok {
-        MsgBox(pf.msg, "Strata 启动器 - 预检失败", "Icon!")
+        MsgBox(Tf(pf.msg), Tf("TinyStrata 启动器 - 预检失败"), "Icon!")
         RefreshStatus()
         return
     }
     if (pf.warns.Length) {
         head := addCheck ? "预览前提醒（不影响 --check）：" : "启动前提醒："
-        if (MsgBox(head . "`n`n  - " . Join(pf.warns, "`n  - ") . "`n`n继续？",
-                   "Strata 启动器", "Icon! 0x4") != "Yes") {
+        if (MsgBox(Tf(head) . "`n`n  - " . Join(pf.warns, "`n  - ") . Tf("`n`n继续？"),
+                   "TinyStrata 启动器", "Icon! 0x4") != "Yes") {
             SetStatusText("用户取消了启动（提醒未通过）", "C00000")
             return
         }
@@ -800,7 +1486,7 @@ DoLaunch(addCheck) {
         RefreshStatus()                          ; 立刻刷一次：状态图马上变"加载中…"，不用等 5 秒定时器
     } catch as e {
         gDriverPid := 0
-        MsgBox("无法启动：`n" . e.Message . "`n`n命令行：`n" . cmd, "Strata 启动器", "Icon!")
+        MsgBox(Tf("无法启动：`n") . e.Message . Tf("`n`n命令行：`n") . cmd, Tf("TinyStrata 启动器"), "Icon!")
     }
     SetTimer(RefreshTick, 1500)
 }
@@ -826,11 +1512,11 @@ DoStop() {
     for p in st.driver
         pids.Push(p.pid)
     if !pids.Length {
-        MsgBox("没有发现运行中的 Strata 进程（引擎 / 服务端 / 护栏 / 驱动 / 启动 cmd 都没有）。", "Strata 启动器", "Iconi")
+        MsgBox(Tf("没有发现运行中的 Strata 进程（引擎 / 服务端 / 护栏 / 驱动 / 启动 cmd 都没有）。"), Tf("TinyStrata 启动器"), "Iconi")
         RefreshStatus()
         return
     }
-    if (MsgBox(StopConfirmText(), "Strata 启动器 - 停止", "Icon! 0x4") != "Yes")
+    if (MsgBox(Tf(StopConfirmText()), Tf("TinyStrata 启动器 - 停止"), "Icon! 0x4") != "Yes")
         return
     killed := 0
     for pid in pids {
@@ -862,7 +1548,7 @@ DoRestart() {
         pids.Push(p)
     for p in st.driver
         pids.Push(p.pid)
-    if (pids.Length && MsgBox(StopConfirmText(), "Strata 启动器 - 重启", "Icon! 0x4") != "Yes")
+    if (pids.Length && MsgBox(Tf(StopConfirmText()), Tf("TinyStrata 启动器 - 重启"), "Icon! 0x4") != "Yes")
         return
     killed := 0
     for pid in pids {
@@ -881,7 +1567,7 @@ DoRestart() {
 
 OpenPath(path) {
     if !FileExist(path) && !DirExist(path) {
-        MsgBox("找不到：`n" . path, "Strata 启动器", "Icon!")
+        MsgBox(Tf("找不到：`n") . path, Tf("TinyStrata 启动器"), "Icon!")
         return
     }
     if DirExist(path)
@@ -934,8 +1620,8 @@ ReviewDriverExit() {
     }
     why := (j.kind = "fail" ? "（code=" . j.code . "）" : "（日志里没有 code= 行：驱动可能压根没起来）")
     SetStatusText("驱动异常退出" . why . " —— 见「驱动输出」", "C00000")
-    MsgBox("驱动异常退出" . why . "，日志：" . gDriverLog . "`n`n最后几行：`n" . LastLines(tl.text, 18),
-        "Strata 启动器", "Icon!")
+    MsgBox(Tf("驱动异常退出") . why . Tf("，日志：") . gDriverLog . Tf("`n`n最后几行：`n") . LastLines(tl.text, 18),
+        "TinyStrata 启动器", "Icon!")
 }
 
 ; ------------------------------------------------- 6. 界面
@@ -1084,14 +1770,14 @@ UpdateDerived() {
 ; （config 里 api_monitor: true 或 --api-monitor 才开），关着时它返回 404 的 JSON
 ; —— 所以只在探到 200 时才出现这一项；平时用始终可用的 /metrics（网页聊天里"监控"页签的数据源）。
 LinkItems(base, monitorOn) {
-    items := [["网页聊天", base . "/"],
+    items := [[Tf("网页聊天"), base . "/"],
               ["/props", base . "/props"],
               ["/v1/models", base . "/v1/models"],
               ["/slots", base . "/slots"],
               ["/health", base . "/health"],
               ["/metrics", base . "/metrics"]]
     if monitorOn
-        items.Push(["API 监控", base . "/api-monitor"])
+        items.Push([Tf("API 监控"), base . "/api-monitor"])
     return items
 }
 
@@ -1135,7 +1821,7 @@ Tip(msg, isErr := false) {
     global gHasGui
     if !gHasGui
         return
-    ToolTip(msg)
+    ToolTip(Tf(msg))
     SetTimer(() => ToolTip(), -2000)
 }
 
@@ -1151,7 +1837,7 @@ SetStatusText(t, color) {               ; 反馈行只存在于专业模式（�
     col := (color = "" || color = "000000" ? "c000080" : "c" . color)
     if IsSet(logs) && IsObject(logs) {
         logs.SetFont("s8 " . col)
-        logs.Text := "最近动作: " . FormatTime(A_Now, "HH:mm:ss") . "  " . ClipText(t, 70)
+        logs.Text := Tf("最近动作: ") . FormatTime(A_Now, "HH:mm:ss") . "  " . ClipText(t, 70)
     }
 }
 
@@ -1162,10 +1848,12 @@ RefreshStatus() {
     sl := StateLine(st)
     st1.SetFont("s9 Bold c" . sl.color)
     st1.Text := sl.text
-      st2.Text := "进程: 引擎 " . (st.procs.engine.Length ? st.procs.engine[1] : "无")
-          . " · 服务端 " . (st.procs.serve.Length ? st.procs.serve[1].pid : "无")
-          . " · 驱动 " . (st.procs.driver.Length ? st.procs.driver[1].pid : "无")
-          . " · 护栏 " . (st.procs.guard.Length ? st.procs.guard[1] : "无")
+      nz := Tf("无")
+      st2.Text := Tf("进程: 引擎 ") . (st.procs.engine.Length ? st.procs.engine[1] : nz)
+              . Tf(" · 服务端 ") . (st.procs.serve.Length ? st.procs.serve[1].pid : nz)
+              . Tf(" · 驱动 ") . (st.procs.driver.Length ? st.procs.driver[1].pid : nz)
+              . Tf(" · 护栏 ") . (st.procs.guard.Length ? st.procs.guard[1] : nz)
+              . " · cmd " . st.procs.launcher.Length
           . " · cmd " . st.procs.launcher.Length
     extra := ""
     if (st.nCtx)
@@ -1180,14 +1868,14 @@ RefreshStatus() {
         gMonitorOn := mon
         MakeLinks(st.port)
     }
-    st3.Text := "端口 " . st.port . " · /props " . (st.http.ok ? "HTTP " . st.http.status : "无响应")
-        . (st.mode != "" ? " · " . (st.mode = "long" ? "长" : "短") . "模式" : "") . extra
-          . " · 监控 " . (mon ? "开" : "关")
+    st3.Text := Tf("端口 ") . st.port . " · /props " . (st.http.ok ? "HTTP " . st.http.status : Tf("无响应"))
+        . (st.mode != "" ? " · " . (st.mode = "long" ? Tf("长") : Tf("短")) . Tf("模式") : "") . extra
+        . Tf(" · 监控 ") . (mon ? Tf("开") : Tf("关"))
     c := (st.ram.free >= 0 && st.ram.free < RAM_ABORT_MB) ? "cC00000"
        : (st.ram.free >= 0 && st.ram.free < MODEL_NEED_MB ? "cB8860B" : "c006400")
     st4.SetFont("s8 " . c)
-    st4.Text := "内存: 空闲 " . Round(st.ram.free / 1024, 1) . " GiB / 共 " . Round(st.ram.total / 1024, 1)
-        . " GiB（护栏阈值 <" . RAM_ABORT_MB . " MB 杀引擎；模型要 ~12 GiB）"
+    st4.Text := Tf("内存: 空闲 ") . Round(st.ram.free / 1024, 1) . Tf(" GiB / 共 ") . Round(st.ram.total / 1024, 1)
+        . Tf(" GiB（护栏阈值 <") . RAM_ABORT_MB . Tf(" MB 杀引擎；模型要 ~12 GiB）")
     snap := GpuSnapshotCached(false)
     others := VramOccupants(snap, st)
     over := (snap.used >= 0 && snap.used > VRAM_WARN_MIB)
@@ -1202,9 +1890,9 @@ RefreshStatus() {
                     . (others.Length ? " · 占用: " . VramWho(others) : "")
                     : "（低于 " . VRAM_WARN_MIB . " MiB 阈值 → 启动前不提醒）")
     st5.SetFont("s8 " . (snap.used < 0 ? "c606060" : (over ? "cC00000" : "c006400")))
-    st5.Text := "显存: " . (snap.used < 0
-        ? "读不到（nvidia-smi 不可用）"
-        : "已用 " . snap.used . " / " . snap.total . " MiB") . occ
+    st5.Text := Tf("显存: ") . (snap.used < 0
+        ? Tf("读不到（nvidia-smi 不可用）")
+        : Tf("已用 ") . snap.used . " / " . snap.total . " MiB") . Tf(occ)
     miss := []
     if !FileExist(PY)
         miss.Push("venv python")
@@ -1215,8 +1903,8 @@ RefreshStatus() {
     logMode := (st.mode != "" ? st.mode : o.mode)
     tail := TailOf(ServerLogFor(logMode), 20000)
     st6.SetFont("s8 " . (miss.Length ? "cC00000" : "c006400"))
-      st6.Text := "文件自检: " . (miss.Length ? "缺 " . Join(miss, "、") : "齐全")
-          . " · " . (logMode = "long" ? "长" : "短") . "模式日志 " . (tail.mtime != "" ? tail.mtime : "无")
+    st6.Text := Tf("文件自检: ") . (miss.Length ? Tf("缺 ") . Join(miss, Tf("、")) : Tf("齐全"))
+        . " · " . (logMode = "long" ? Tf("长") : Tf("短")) . Tf("模式日志 ") . (tail.mtime != "" ? tail.mtime : Tf("无"))
     tailE.Value := LastLines(tail.text, 14)
     SimpleStatusUpdate(st)                  ; 简洁模式那边只更新状态图
 }
@@ -1245,7 +1933,7 @@ BuildGui() {
     opt := "-MaximizeBox"
     if ONTOP
         opt := "+AlwaysOnTop " . opt       ; 只有 --ontop 时才置顶（调试用）；正常使用不置顶
-    g := Gui(opt, "Strata 启动器 - Qwen3.6-35B-A3B UD-IQ3_S")
+    g := Gui(opt, Tf("TinyStrata 启动器"))
     gHasGui := true
     g.SetFont("s9", "Segoe UI")
 
@@ -1372,6 +2060,8 @@ BuildGui() {
     gLinks := []
     guiAlive := true
     g.OnEvent("Close", OnClose)
+    AddLangMenu(g)
+    TranslateGui(g)
     return g
 }
 
@@ -1396,12 +2086,12 @@ SetCurrent(o) {
 ; 状态图：简洁模式只讲四件事
 StateBadge(st) {
     if (st.state = "running")
-        return {glyph: "●", word: "运行中", color: "008000"}
+        return {glyph: "●", word: Tf("运行中"), color: "008000"}
     if (st.state = "loading")
-        return {glyph: "◐", word: "加载中…", color: "B8860B"}
+        return {glyph: "◐", word: Tf("加载中…"), color: "B8860B"}
     if (st.state = "zombie")
-        return {glyph: "✕", word: "异常", color: "C00000"}
-    return {glyph: "○", word: "未运行", color: "808080"}
+        return {glyph: "✕", word: Tf("异常"), color: "C00000"}
+    return {glyph: "○", word: Tf("未运行"), color: "808080"}
 }
 
 ChatUrl(port) {                              ; 网页聊天
@@ -1466,7 +2156,7 @@ UpdateSimpleDerived(port) {
         return
     gLastBasePort := port
     sBaseE.Text := BaseUrl(port)
-    sChatLink.Text := '<a href="' . ChatUrl(port) . '">打开网页聊天</a>'
+    sChatLink.Text := '<a href="' . ChatUrl(port) . '">' . Tf("打开网页聊天") . "</a>"
 }
 
 SimpleStatusUpdate(st) {
@@ -1514,13 +2204,13 @@ SwitchTo(mode, show := true) {
 
 BuildSimpleGui() {
     global
-    sg := Gui("-MaximizeBox", "Strata 启动器 - 简洁模式")
+    sg := Gui("-MaximizeBox", Tf("TinyStrata 启动器"))
     gHasGui := true
     if ONTOP
         sg.Opt("+AlwaysOnTop")
     sg.SetFont("s10", "Segoe UI")
 
-    sg.AddText("x22 y14 w300", "Strata 启动器 · 简洁模式")
+    sg.AddText("x22 y14 w300", "TinyStrata 启动器")
     sg.AddButton("x344 y8 w108 h28", "专业模式 →").OnEvent("Click", (*) => SwitchTo("pro"))
 
     sg.AddGroupBox("x8 y44 w444 h48", "模式")
@@ -1558,7 +2248,7 @@ BuildSimpleGui() {
     sg.AddButton("x112 y320 w84 h36", "重启").OnEvent("Click", (*) => DoRestart())
     sg.AddButton("x202 y320 w72 h36", "停止").OnEvent("Click", (*) => DoStop())
     sg.AddButton("x280 y320 w72 h36", "刷新").OnEvent("Click", (*) => RefreshStatus())
-    sg.AddButton("x358 y320 w84 h36", "保存为默认").OnEvent("Click", (*) => SaveIni(CollectCurrent()))
+    sg.AddButton("x352 y320 w90 h36", "保存为默认").OnEvent("Click", (*) => SaveIni(CollectCurrent()))
 
     sg.AddGroupBox("x8 y366 w444 h74", "浏览器")
     sChatLink := sg.AddLink("x22 y386 w300 h24 cBlue", "打开网页聊天")   ; 建 Link 时必须给文字/宽度，
@@ -1570,6 +2260,8 @@ BuildSimpleGui() {
 
     gSimple := sg
     sg.OnEvent("Close", OnClose)
+    AddLangMenu(sg)
+    TranslateGui(sg)
     return sg
 }
 
@@ -1625,8 +2317,8 @@ LoadIni() {
         p := LoadSection(mode = "long" ? "long" : "short", mode)
         SetCurrent(p)
         UpdateDerived()
-        SetStatusText("已载入上次设置（" . (p.mode = "long" ? "长" : "短") . "模式 ctx=" . p.ctx
-            . " port=" . p.port . "），改完点「启动」", "000080")
+        SetStatusText(Tf("已载入上次设置（") . (p.mode = "long" ? Tf("长") : Tf("短")) . Tf("模式 ctx=") . p.ctx
+            . " port=" . p.port . Tf("），改完点「启动」"), "000080")
         return true
     } catch
         return false
@@ -1714,9 +2406,11 @@ RunDriverCheck(o, tag) {                ; 跑驱动 --check，返回退出码与
 Selftest() {
     global selfBuf, DEV, gUiMode, gParams, gIgnoreIni
     selfBuf := ""
-    SelfSay("Strata 启动器自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
+    SelfSay("TinyStrata 启动器自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
 
     SelfSay("`n--- 1. 文件 ---")
+    SelfCheck("引擎 strata.exe  " . EXE, FileExist(EXE))
+    SelfCheck("服务层 serve\server.py  " . SERVER_PY, FileExist(SERVER_PY))
     SelfCheck("venv python  " . PY, FileExist(PY))
     SelfCheck("驱动        " . DRIVER, FileExist(DRIVER))
     SelfCheck("模板配置    " . BASE_CFG, FileExist(BASE_CFG))
@@ -2098,6 +2792,18 @@ if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     ExitApp(0)
 }
 
+if (A_Args.Length >= 1 && A_Args[1] = "--i18ntest") {
+    OnError(SelftestError)
+    I18ntest()
+    ExitApp(0)
+}
+
+if (A_Args.Length >= 1 && A_Args[1] = "--findtest") {
+    OnError(SelftestError)                       ; 出错写报告文件，绝不弹框卡住
+    Findtest()                                   ; 定位逻辑自检（造临时目录树）
+    ExitApp(0)
+}
+
 gLinks := []
 guiAlive := true
 
@@ -2142,6 +2848,6 @@ try {
         try FileAppend("guismoke FAIL " . e.Message . "  @" . e.Line . "  (" . e.What . ")`n", SMOKELOG, "UTF-8")
         ExitApp(3)
     }
-    MsgBox("界面启动失败：`n" . e.Message . "`n位置：" . e.What . " @行 " . e.Line, "Strata 启动器", "Icon!")
+    MsgBox(Tf("界面启动失败：`n") . e.Message . Tf("`n位置：") . e.What . Tf(" @行 ") . e.Line, Tf("TinyStrata 启动器"), "Icon!")
     ExitApp(4)
 }
