@@ -2318,6 +2318,24 @@ ApplyPreset(mode) {
         . (p.resident > 0 ? " / 流式" . p.resident : " / 全常驻") . " / MTP " . p.mtp)
 }
 
+; 上次启动时服务端算出的容量估算（results/capacity.json）；模型或 kv 对不上就返回 ""
+CapacityText(native, kv) {
+    global RESULTS
+    f := RESULTS . "\capacity.json"
+    if !FileExist(f)
+        return ""
+    try {
+        s := FileRead(f, "UTF-8")
+        if (RegExMatch(s, '"model"\s*:\s*"([^"]*)"', &m1) && RegExMatch(s, '"kv"\s*:\s*"([^"]*)"', &m2)
+            && RegExMatch(s, '"ctx_estimate"\s*:\s*(\d+)', &m3)) {
+            if (StrLower(m1[1]) != StrLower(BaseName(native)) || m2[1] != kv)
+                return ""
+            return "服务端估算 ~" . m3[1] . " ctx"
+        }
+    }
+    return ""
+}
+
 ; 简洁模式改了 ctx 时，把专业模式的「边界检查」那行也刷新
 UpdateProBoundary() {
     global bndT
@@ -2326,7 +2344,8 @@ UpdateProBoundary() {
     o := SimpleCollect()
     if (o.ctx > 0 && o.resident >= 0) {
         bndT.SetFont("s9 " . (BoundaryExceeded(o) ? "cC00000" : "c006400"))
-        bndT.Text := "边界检查: " . BoundaryText(o)
+        cap := CapacityText(Prop(o, "native", ""), o.kv)
+        bndT.Text := "边界检查: " . BoundaryText(o) . (cap != "" ? "  ·  " . cap : "")
     }
 }
 
@@ -2338,7 +2357,8 @@ UpdateDerived() {
     if (o.ctx > 0 && o.resident >= 0) {
         bad := BoundaryExceeded(o)
         bndT.SetFont("s9 " . (bad ? "cC00000" : "c006400"))
-        bndT.Text := "边界检查: " . BoundaryText(o)
+        cap := CapacityText(Prop(o, "native", ""), o.kv)
+        bndT.Text := "边界检查: " . BoundaryText(o) . (cap != "" ? "  ·  " . cap : "")
     }
     MakeLinks(o.port > 0 ? o.port : 1339, gMonitorOn)
     UpdateSimpleDerived(o.port > 0 ? o.port : 1339)
@@ -2531,12 +2551,11 @@ BuildGui() {
     g.AddGroupBox("x8 y118 w704 h206", "参数（改完直接点启动；字段名与驱动一致）")
       ; 模型两行（与简洁模式同形状）：标签 + 只读路径 + 选择…
     g.AddText("x22 y142 w44", "GGUF")
-    nativeE := g.AddEdit("x70 y138 w396 h24 ReadOnly", "")
+    nativeE := g.AddEdit("x70 y138 w400 h24 ReadOnly", "")
     nativeE.SetFont("s8")
     g.AddButton("x474 y136 w70 h26", "选择…").OnEvent("Click", (*) => PickNative())
-    g.AddButton("x550 y136 w60 h26", "清空").OnEvent("Click", (*) => (nativeE.Value := "", mmprojE.Value := "", UpdateVisionEnabled(), Tip("已清空 GGUF/mmproj 覆盖")))
     g.AddText("x22 y168 w50", "mmproj")
-    mmprojE := g.AddEdit("x76 y164 w390 h24 ReadOnly", "")
+    mmprojE := g.AddEdit("x76 y164 w394 h24 ReadOnly", "")
     mmprojE.SetFont("s8")
     g.AddButton("x474 y162 w70 h26", "选择…").OnEvent("Click", (*) => PickMmproj())
     ; 4 列网格：标签宽 76 / 输入宽 76 / 列距 160（列起点 x22 / x182 / x342 / x502）
