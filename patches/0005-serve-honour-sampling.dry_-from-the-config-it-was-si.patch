@@ -1,0 +1,85 @@
+From 2987aeba5e96557f39b7837bb5b65582326e8d39 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 15:42:59 +0800
+Subject: [PATCH 5/5] serve: honour sampling.dry_* from the config (it was
+ silently dropped)
+
+sampling_keys() (the DRY patch) emits dry_multiplier/dry_base/dry_allowed_length/
+dry_penalty_last_n into the engine's GEN line, but sampling_defaults_from_config()'s
+whitelist did not know those keys, so a config that set them got
+'config sampling.dry_multiplier=1.5: unknown key, ignored' and the engine ran with DRY off.
+Anything that configured DRY through the config (the template's sampling block, and the
+driver's --dry-* flags, which it writes there) therefore had no effect.
+
+- sampling_defaults_from_config(): accept the four keys with the usual validation
+  (multiplier >= 0 with 0 = off, base > 1, allowed_length >= 0, penalty_last_n > 0)
+- clean_shared_defaults(): same four keys, so a client can send them per request too
+Verified: sampling_defaults_from_config({'sampling': {...1.5/1.75/2/64}}) returns all four,
+bad values raise SystemExit, and sampling_keys() now emits
+'temperature=0.6 top_p=0.95 top_k=20 dry_multiplier=1.5 dry_base=1.75 dry_allowed_length=2 dry_penalty_last_n=64'
+---
+ serve/server.py | 37 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index afa06e6a..c551ab0c 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6064,6 +6064,23 @@ def clean_shared_defaults(d) -> dict:
+             if not number or value != int(value) or value < 0:
+                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
+             value = int(value)
++        elif key == "dry_multiplier":
++            # DRY (llama.cpp): a penalty that grows with the length of a repeated sequence. 0 = off
++            if not number or value < 0:
++                raise SystemExit(f"[strata] config sampling.dry_multiplier={value!r}: expected a number >= 0 (0 = off)")
++            out[key] = float(value)
++        elif key == "dry_base":
++            if not number or value <= 1:
++                raise SystemExit(f"[strata] config sampling.dry_base={value!r}: expected a number > 1")
++            out[key] = float(value)
++        elif key == "dry_allowed_length":
++            if not number or value != int(value) or value < 0:
++                raise SystemExit(f"[strata] config sampling.dry_allowed_length={value!r}: expected a non-negative integer")
++            out[key] = int(value)
++        elif key == "dry_penalty_last_n":
++            if not number or value != int(value) or value <= 0:
++                raise SystemExit(f"[strata] config sampling.dry_penalty_last_n={value!r}: expected a positive integer")
++            out[key] = int(value)
+         elif key == "experimental_speed_projection":
+             if not isinstance(value, bool):
+                 raise ValueError("experimental_speed_projection: true or false")
+@@ -6113,7 +6130,8 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
+     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
+     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
+     presence_penalty, repetition_penalty (also written repeat_penalty), frequency_penalty, penalty_last_n (also
+-    repeat_last_n), seed.  The request's own fields
++    repeat_last_n), seed, and the DRY group (dry_multiplier, dry_base, dry_allowed_length,
++    dry_penalty_last_n).  The request's own fields
+     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
+     are named at startup and ignored."""
+@@ -6165,6 +6183,23 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
+             if not number or value != int(value) or value <= 0:
+                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+             out[key] = int(value)
++        elif key == "dry_multiplier":
++            # DRY (llama.cpp): a penalty that grows with the length of a repeated sequence. 0 = off
++            if not number or value < 0:
++                raise SystemExit(f"[strata] config sampling.dry_multiplier={value!r}: expected a number >= 0 (0 = off)")
++            out[key] = float(value)
++        elif key == "dry_base":
++            if not number or value <= 1:
++                raise SystemExit(f"[strata] config sampling.dry_base={value!r}: expected a number > 1")
++            out[key] = float(value)
++        elif key == "dry_allowed_length":
++            if not number or value != int(value) or value < 0:
++                raise SystemExit(f"[strata] config sampling.dry_allowed_length={value!r}: expected a non-negative integer")
++            out[key] = int(value)
++        elif key == "dry_penalty_last_n":
++            if not number or value != int(value) or value <= 0:
++                raise SystemExit(f"[strata] config sampling.dry_penalty_last_n={value!r}: expected a positive integer")
++            out[key] = int(value)
+         elif key == "experimental_speed_projection":
+             if not isinstance(value, bool):
+                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
