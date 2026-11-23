@@ -80,7 +80,8 @@ TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动
 
 | 文件 | 从哪来 |
 |---|---|
-| **`TinyStrata-Launcher.exe`**（v0.1.0） | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（538 KiB，**不装 AutoHotkey 也能跑**） |
+| **`TinyStrata-0.1.0-portable.zip`**（53.7 MB） | **最省事的一条路**：解压 → 双击 `TinyStrata-Launcher.exe` → 选 GGUF → 启动。内含引擎、启动器、`serve\`、内嵌 Python 3.11 + numpy，**不用装 Python，也不用装 AutoHotkey** |
+| `TinyStrata-Launcher.exe`（v0.1.0） | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（538 KiB，**不装 AutoHotkey 也能跑**） |
 | `strata.exe` + `strata.exe.sha256` | 同上（61.7 MiB，CUDA 12.8 / sm_86） |
 | `strata-launcher.ahk`（可选） | 本仓库 [launcher/](launcher/)（想自己改界面才需要 AutoHotkey v2） |
 | `strata-run.py`（可选） | 本仓库 [tools/](tools/)，命令行驱动 |
@@ -98,7 +99,39 @@ Get-FileHash strata.exe -Algorithm SHA256
 Get-Content strata.exe.sha256
 ```
 
-### 4.2 就位
+### 4.2 便携包（推荐给"只想跑起来"的人）
+
+`TinyStrata-0.1.0-portable.zip` 解压后是这样：
+
+```
+TinyStrata\
+├── TinyStrata-Launcher.exe     启动器（已编译，不需要 AutoHotkey）
+├── python\                     内嵌 CPython 3.11 + numpy / jinja2 / psutil / gguf
+├── strata\
+│   ├── engine-cuda12\strata.exe
+│   ├── serve\                   OpenAI 兼容层 + 网页聊天
+│   ├── tools\                   iq_pack.py / make_pack.py / gguf_reader.py ...
+│   └── data\                    专家 profile + draft vocab
+├── tools\strata-run.py          命令行驱动（启动器会调它）
+├── strata-qwen36-iq3s.json      模板（保留 %占位符%，服务端会自动补）
+├── configs\ docs\ README 等
+└── results\  sessions\          运行时生成；pack 会自动建在 ..\packs\
+```
+
+**第一次运行**：双击 `TinyStrata-Launcher.exe` → 「模型」里 `GGUF` 选你的文件 → `启动`。
+服务端会在引擎启动前自动做这几件事（日志里能看到 `[prepare]` 行）：
+
+1. 给这个 GGUF 建 pack（约 3 秒 / 65 MB，专家仍留在 GGUF 里）
+2. 把 `--pack` 和 `tokenizer` 指到新 pack
+3. 模板里还是占位符的 `exe` / `cwd` / `--expert-profile` / `--mtp-draft-vocab` / `--mtp` 用包内自带的文件补齐
+4. 视觉编码器不存在 → 自动关掉 vision（不报错）
+
+实测（便携树、内嵌 python、没有装任何东西）：给一个 GGUF 路径后
+`ready: http://127.0.0.1:13501/v1 (context 20480 tokens)`。
+
+`FIRST-RUN.txt` 里也写了这几步；日志在 `results\`。
+
+### 4.2.1 就位
 
 ```powershell
 # <install> = 你放 TinyStrata 的目录，例如 C:\TinyStrata（下面都用它当例子）

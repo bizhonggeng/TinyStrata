@@ -1,7 +1,7 @@
 From 8d17d13f00e043aa4fa59cd35dae349192754d93 Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 11:25:56 +0800
-Subject: [PATCH 3/5] serve/setup/tools: session autosave, log timestamps,
+Subject: [PATCH 3/6] serve/setup/tools: session autosave, log timestamps,
  --chat-template-file, quant list
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

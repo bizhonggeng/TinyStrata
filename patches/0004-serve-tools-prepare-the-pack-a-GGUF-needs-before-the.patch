@@ -1,7 +1,7 @@
 From 10ba3195f2e63a7b126169361de3191530012b5f Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 15:27:35 +0800
-Subject: [PATCH 4/5] serve/tools: prepare the pack a GGUF needs, before the
+Subject: [PATCH 4/6] serve/tools: prepare the pack a GGUF needs, before the
  engine starts
 
 The engine reads a pack (dense weights in its layout, tensor index, tokenizer, expert

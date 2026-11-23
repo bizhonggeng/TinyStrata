@@ -86,7 +86,8 @@ smaller quant wins and the i-quant path costs nothing extra.
 
 | File | Where |
 |---|---|
-| **`TinyStrata-Launcher.exe`** (v0.1.0) | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
+| **`TinyStrata-0.1.0-portable.zip`** (53.7 MB) | **the short path**: unzip -> double-click `TinyStrata-Launcher.exe` -> pick the GGUF -> Start. Ships the engine, the launcher, `serve\` and an embedded Python 3.11 + numpy -- **no Python and no AutoHotkey install** |
+| `TinyStrata-Launcher.exe` (v0.1.0) | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
 | `strata.exe` + `strata.exe.sha256` | same release (61.7 MiB, CUDA 12.8 / sm_86) |
 | `strata-launcher.ahk` (optional) | this repo, [launcher/](launcher/) (only if you want to change the UI) |
 | `strata-run.py` (optional) | this repo, [tools/](tools/), the CLI driver |
@@ -105,7 +106,40 @@ Get-FileHash strata.exe -Algorithm SHA256
 Get-Content strata.exe.sha256
 ```
 
-### 4.2 Put the files in place
+### 4.2 Portable bundle (the "just make it run" path)
+
+`TinyStrata-0.1.0-portable.zip` unpacks to:
+
+```
+TinyStrata\
+├── TinyStrata-Launcher.exe     launcher (compiled, no AutoHotkey needed)
+├── python\                     embedded CPython 3.11 + numpy / jinja2 / psutil / gguf
+├── strata\
+│   ├── engine-cuda12\strata.exe
+│   ├── serve\                  the OpenAI-compatible layer + web chat
+│   ├── tools\                  iq_pack.py / make_pack.py / gguf_reader.py ...
+│   └── data\                   expert profile + draft vocab
+├── tools\strata-run.py         the CLI driver the launcher spawns
+├── strata-qwen36-iq3s.json     template (keeps %placeholders%; the server fills them)
+├── configs\ docs\ README ...
+└── results\  sessions\         created at runtime; the pack goes to ..\packs\
+```
+
+**First run**: double-click `TinyStrata-Launcher.exe`, pick your GGUF under Model, press Start.
+Before the engine starts the server does this (visible as `[prepare]` lines):
+
+1. build the pack for that GGUF (3 s / 65 MB; the experts stay in the GGUF)
+2. repoint `--pack` and `tokenizer`
+3. fill the template's remaining placeholders -- `exe`, `cwd`, `--expert-profile`,
+   `--mtp-draft-vocab`, `--mtp` -- from the files shipped in the bundle
+4. drop the vision encoder when it is not there instead of failing
+
+Measured on the portable tree (embedded python, nothing installed): after naming one GGUF it
+printed `ready: http://127.0.0.1:13501/v1 (context 20480 tokens)`.
+
+`FIRST-RUN.txt` repeats this; logs land in `results\`.
+
+### 4.2.1 Put the files in place
 
 ```powershell
 # <install> = wherever you put TinyStrata, e.g. C:\TinyStrata (used below)

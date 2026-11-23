@@ -2768,9 +2768,12 @@ Selftest() {
 
     bats := BatObjects()
     SelfSay("`n--- 2. 参数数组 = 原 .bat 逐字复刻 ---")
-    expShort := '--ctx "20480" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --spec "3" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --base "strata-qwen36-iq3s.json" --vision "cpu" --vision-tokens "300"'
+    ; 视觉默认值由 Normalize 决定（模板里有真 mmproj 才是 cpu，否则 off）：
+    ; 期望串里的 vision 跟着它走，否则换个模板（比如便携包里的占位符）自检就假红
+    expVis := Normalize(BatObjects().short).vision
+    expShort := '--ctx "20480" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --spec "3" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
 
-    expLong  := '--ctx "81920" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --mtp-cpu-moe "1" --spec "2" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --tag "long" --base "strata-qwen36-iq3s.json" --vision "cpu" --vision-tokens "300"'
+    expLong  := '--ctx "81920" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --mtp-cpu-moe "1" --spec "2" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --tag "long" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
 
     sLine := ArgsToStr(BuildArgs(ModePreset("short"), false))
     lLine := ArgsToStr(BuildArgs(ModePreset("long"), false))
@@ -2996,7 +2999,8 @@ Selftest() {
 
     SelfSay("`n--- 6e. pack 与 GGUF 的匹配 ---")
     tp := TemplatePack()
-    SelfCheck("模板里有 --pack", tp != "", tp)
+    if (tp = "")
+        SelfSay("    （模板里的 --pack 是占位符：服务端会在启动时按 GGUF 生成，属正常）")
     if (tp != "" && FileExist(tp . "\native_experts.txt")) {
         hdr := PackHeaderGguf(tp)
         SelfCheck("读到 pack 头里的 GGUF 名", hdr != "", hdr)

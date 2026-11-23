@@ -44,7 +44,25 @@ def _resolve_home() -> Path:
 
 DEV = _resolve_home()                                   # config / logs / sessions
 ROOT = Path(os.path.expandvars(os.environ.get("STRATA_ROOT", str(DEV / "strata")))).resolve()
-PY = Path(os.path.expandvars(os.environ.get("STRATA_PYTHON", str(ROOT / ".venv" / "Scripts" / "python.exe"))))
+def _find_python() -> Path:
+    """The interpreter the server is launched with.
+
+    A checkout has .venv\Scripts\python.exe; the portable bundle ships python\python.exe;
+    otherwise fall back to whatever is running this script (that is always right).
+    """
+    env = os.environ.get("STRATA_PYTHON")
+    if env:
+        return Path(os.path.expandvars(env))
+    for cand in (ROOT / ".venv" / "Scripts" / "python.exe",
+                 DEV / ".venv" / "Scripts" / "python.exe",
+                 ROOT / "python" / "python.exe",
+                 DEV / "python" / "python.exe"):
+        if cand.is_file():
+            return cand
+    return Path(sys.executable)
+
+
+PY = _find_python()
 BASE_CFG = Path(os.path.expandvars(os.environ.get("STRATA_CONFIG", str(DEV / "strata-qwen36-iq3s.json"))))
 RUN_CFG = DEV / "strata-qwen36-run.json"
 GUARD = Path(os.environ.get("STRATA_GUARD", str(DEV / "tools" / "strata-ram-guard.py")))

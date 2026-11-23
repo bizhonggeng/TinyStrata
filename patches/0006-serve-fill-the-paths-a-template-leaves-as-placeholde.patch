@@ -1,0 +1,187 @@
+From 90a0167f96fe60fb702592d5d70e1b9f4e6212ad Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 16:16:41 +0800
+Subject: [PATCH 6/6] serve: fill the paths a template leaves as %placeholders%
+
+The portable bundle ships a template with %STRATA_ROOT%/%STRATA_PACKS% style placeholders
+because it cannot know where the user puts the GGUF or the packs.  prepare.py now closes
+that hole before the engine starts:
+
+- _expand(): os.path.expandvars over the whole config (a user who does set the variables
+  gets them honoured everywhere, not just in the strings the driver expands)
+- ensure_paths(): exe / cwd / log / --expert-profile / --mtp-draft-vocab / --mtp fall back
+  to the checkout's own files when they are still placeholders or missing. Model paths are
+  never guessed.
+- ensure_vision(): if the image encoder's exe/mmproj/model is a placeholder or missing, drop
+  the vision block and pass --vision off instead of letting the server spawn nothing
+- the pack root with a placeholder --pack falls back to <install>/packs (derived from
+  serve/.. ..), not to a path built from the placeholder cwd
+
+Verified with the portable tree (embedded python, no install): one GGUF path ->
+pack built in 2.3 s -> exe/cwd/profile/mtp filled -> vision off ->
+'ready: http://127.0.0.1:13501/v1 (context 20480 tokens)'.
+---
+ serve/prepare.py | 107 ++++++++++++++++++++++++++++++++++++++++++++++-
+ serve/server.py  |  13 ++++++
+ 2 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/serve/prepare.py b/serve/prepare.py
+index da69bbbc..d0e0ab44 100644
+--- a/serve/prepare.py
++++ b/serve/prepare.py
+@@ -54,6 +54,102 @@ def _make_pack_script(root: pathlib.Path) -> pathlib.Path | None:
+     return None
+ 
+ 
++def _expand(obj):
++    """os.path.expandvars over every string of a config (args, exe, cwd, ...)."""
++    if isinstance(obj, str):
++        return os.path.expandvars(obj)
++    if isinstance(obj, list):
++        return [_expand(v) for v in obj]
++    if isinstance(obj, dict):
++        return {k: _expand(v) for k, v in obj.items()}
++    return obj
++
++
++def _unresolved(v) -> bool:
++    return isinstance(v, str) and "%" in v
++
++
++def ensure_paths(cfg: dict, log=print) -> bool:
++    """Fill the paths a template leaves as %placeholders% (the portable bundle's case).
++
++    Only the keys this project owns get a default: engine exe, cwd, log, and the two
++    data files in the checkout (expert profile, draft vocab).  A model path is never
++    guessed -- that one has to come from the launcher/config.
++    """
++    checkout = pathlib.Path(__file__).resolve().parent.parent          # <install>/strata
++    install = checkout.parent                                          # <install>
++    changed = False
++
++    def fix(container: dict, key: str, default: pathlib.Path) -> None:
++        nonlocal changed
++        cur = container.get(key)
++        if cur is None and default is None:
++            return
++        if cur is None or _unresolved(cur) or not pathlib.Path(str(cur)).exists():
++            container[key] = str(default)
++            changed = True
++            log(f"[prepare] {key} -> {default}")
++
++    if _unresolved(cfg.get("exe")) or not pathlib.Path(str(cfg.get("exe") or "")).exists():
++        fix(cfg, "exe", checkout / "engine-cuda12" / "strata.exe")
++    if _unresolved(cfg.get("cwd")) or not pathlib.Path(str(cfg.get("cwd") or ".")).is_dir():
++        fix(cfg, "cwd", checkout)
++    if _unresolved(cfg.get("log")) or cfg.get("log") is None:
++        logdir = install / "results"
++        try:
++            logdir.mkdir(parents=True, exist_ok=True)
++        except OSError:
++            pass
++        fix(cfg, "log", logdir / "strata.log")
++
++    args = list(cfg.get("args") or [])
++    native = _arg(args, "--native")
++    defaults = {"--expert-profile": checkout / "data" / "expert-profile-qwen36.bin",
++                "--mtp-draft-vocab": checkout / "data" / "draft_vocab_en.bin"}
++    for flag, default in defaults.items():
++        if flag not in args:
++            continue
++        i = args.index(flag) + 1
++        if i < len(args) and _unresolved(args[i]):
++            args[i] = str(default)
++            changed = True
++            log(f"[prepare] {flag} -> {default}")
++    if native and "--mtp" in args:
++        i = args.index("--mtp") + 1
++        if i < len(args) and _unresolved(args[i]):
++            args[i] = native                       # the model file carries its own MTP layer
++            changed = True
++            log(f"[prepare] --mtp -> {native}")
++    if changed:
++        cfg["args"] = args
++    return changed
++
++
++def ensure_vision(cfg: dict, log=print) -> bool:
++    """Drop the vision encoder when its files are placeholders or missing.
++
++    A template that ships %STRATA_ROOT% placeholders (the portable bundle) would otherwise
++    make the server try to spawn a non-existent encoder and die before the engine starts.
++    """
++    vis = cfg.get("vision")
++    if not isinstance(vis, dict) or not vis:
++        return False
++    for key in ("exe", "mmproj", "model"):
++        raw = str(vis.get(key) or "")
++        if not raw:
++            continue
++        path = os.path.expandvars(raw)
++        if "%" in path or not pathlib.Path(path).is_file():
++            log(f"[prepare] 视觉不可用（{key}={raw}）→ 关掉 vision")
++            cfg.pop("vision", None)
++            args = list(cfg.get("args") or [])
++            if "--vision" in args:
++                args[args.index("--vision") + 1] = "off"
++                cfg["args"] = args
++            return True
++    return False
++
++
+ def ensure_pack(cfg: dict, family: str = "qwen36", log=print) -> bool:
+     """Prepare cfg['args'] so that its --pack matches its --native.  True if we changed it."""
+     args = list(cfg.get("args") or [])
+@@ -66,12 +162,19 @@ def ensure_pack(cfg: dict, family: str = "qwen36", log=print) -> bool:
+         return False
+ 
+     cur = _arg(args, "--pack")
++    if cur:
++        cur = os.path.expandvars(cur)                    # a config may keep %STRATA_PACKS% for the user to set
++    if cur and "%" in cur:                               # still a placeholder: no usable pack yet
++        cur = ""
+     cur_dir = pathlib.Path(cur) if cur else None
+     if cur_dir and header_gguf(cur_dir).lower() == gguf.name.lower():
+         return False                                     # already the right pack
+ 
+-    root = (cur_dir.parent if cur_dir else
+-            pathlib.Path(cfg.get("cwd") or ".") / "packs")
++    if cur_dir:
++        root = cur_dir.parent
++    else:
++        # <install>/strata/serve/prepare.py -> <install>/packs; the config's cwd may be a placeholder
++        root = pathlib.Path(__file__).resolve().parent.parent.parent / "packs"
+     target = root / pack_tag(gguf, family)
+ 
+     if cur_dir and header_gguf(cur_dir) == "" and cur_dir.is_dir():
+diff --git a/serve/server.py b/serve/server.py
+index c551ab0c..3486c74d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6347,6 +6347,12 @@ def main() -> int:
+     # A GGUF without its pack: the pack is derived data (dense weights + index + tokenizer + expert
+     # offsets), so it is prepared here -- the launcher only names the model.  Idempotent and fast
+     # (3 s / ~65 MB); it also repoints --pack and tokenizer when the model changed.
++    if cfg:
++        try:
++            from serve import prepare as prepare_mod0
++            cfg = prepare_mod0._expand(cfg)        # %VAR% -> value, everywhere in the config
++        except Exception as e:
++            print(f"[strata] config expansion failed: {e}", flush=True)
+     pack_changed = False
+     if cfg.get("args"):
+         try:
+@@ -6356,6 +6362,13 @@ def main() -> int:
+             print(f"[strata] pack preparation failed: {e}", flush=True)
+     if pack_changed and cfg.get("tokenizer"):
+         a.tokenizer = cfg["tokenizer"]
++    try:
++        from serve import prepare as prepare_mod2
++        prepare_mod2.ensure_paths(cfg, log=lambda m: print(m, flush=True))
++        a.tokenizer = cfg.get("tokenizer") or a.tokenizer
++        prepare_mod2.ensure_vision(cfg, log=lambda m: print(m, flush=True))
++    except Exception as e:
++        print(f"[strata] vision preparation failed: {e}", flush=True)
+     # 日志时间戳：默认开，配置里 "log_timestamps": false 关掉（服务端 print 与引擎 stderr 都加 HH:MM:SS）
+     global LOG_TIMESTAMPS
+     LOG_TIMESTAMPS = cfg.get("log_timestamps", True) is not False
