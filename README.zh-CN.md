@@ -111,12 +111,45 @@ copy strata-run.py           <install>\tools\
 （`tools/strata-run.py` 的上一级就是 `<install>`）。要换布局就用环境变量
 `STRATA_HOME` / `STRATA_ROOT` 显式指定，见 §5.3。
 
-### 4.3 建一次 pack（必须做一次，之后复用）
+### 4.3 pack：这是什么、为什么换模型要换它
+
+引擎不直接吃 GGUF：它要一个"pack"。pack **不是模型的副本** —— 里面只有
+
+```
+<packs>/qwen36-UD-IQ3_S/
+  dense.bin            53 MB   非专家权重（attention/norm/embedding）转成引擎的布局
+  index.txt            52 KB   613 个张量的索引
+  native_experts.txt    4 KB   ★ 每层专家在 GGUF 里的字节偏移（12 GiB 专家留在 GGUF，不复制）
+  tokenizer\          9.7 MB
+  conversions.json / compat-bf16.json   量化转换元数据
+```
+
+所以做一次 pack 只要 **3 秒 / 65 MB**（实测，15.3 GB 的 GGUF）。三条路任选：
+
+**A. 直接用 Release 里的现成 pack（推荐，零依赖）**
+
+对应 `UD-IQ3_S` 的 pack 已经打好：
+`Releases → pack-qwen36-UD-IQ3_S.zip`（43.7 MB），解压到模板里 `--pack` 的**上一级**目录
+（默认 `<install>\packs\`），得到 `<install>\packs\qwen36-UD-IQ3_S\dense.bin …`。
+
+**B. 让启动器自动做（3 秒）**
+
+在启动器里选 GGUF：它会按 `native_experts.txt` 里记录的文件名去找匹配的 pack，
+找到就直接用；找不到会问"现在生成吗？"，点是就当场做好并自动接上
+（输出在 `<install>\results\make-pack.log`）。
+
+**C. 命令行**
 
 ```powershell
-cd <install>\strata
-python setup.py --family qwen36 --model UD-IQ3_S
+python tools\make_pack.py --gguf <你的.gguf> --packs <install>\packs
 ```
+
+> **换量化必须换 pack。** pack 的 `native_experts.txt` 里写明了它指向哪个 GGUF 文件；
+> 拿 IQ3_S 的 pack 配 IQ4_XS 的模型会静默读出垃圾。启动器现在会在启动前比对文件名，
+> 不一致直接拦下并说明原因。
+
+（`setup.py --family qwen36 --model UD-IQ3_S` 是"全套流程"那条路：它会下模型、建 pack、
+选 MTP 层、写配置，适合从零开始；只要 pack 的话用上面 A/B/C 更快。）
 
 ### 4.4 配模板
 
@@ -256,6 +289,8 @@ Niko1221 及贡献者）。`LICENSE` 是上游原样，派生关系与免责声�
   [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) 的三步判据验一遍：
   `qwen35moe` + `block_count 41` + 文件名带 MTP / `strata_inspect.py` 结尾打印
   `with an MTP layer`。
+- **配套 pack**：`UD-IQ3_S` 用 Release 里的 `pack-qwen36-UD-IQ3_S.zip`（43.7 MB）；
+  其他量化用 `tools/make_pack.py` 现做（3 秒 / 65 MB）—— 详见 §4.3。
 - 模型许可：Unsloth 的这份 GGUF 是 Apache-2.0；模型权重不在本仓库内。
 
 ---

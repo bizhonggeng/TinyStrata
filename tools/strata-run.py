@@ -119,6 +119,8 @@ def parse() -> argparse.Namespace:
                     help="每张图占用的上下文 token（默认 300；GPU 编码器可到 1024）")
     ap.add_argument("--native", default=None,
                     help="覆盖模板里的 --native（GGUF 路径）；换模型文件时用，pack 需与之匹配")
+    ap.add_argument("--pack", default=None,
+                    help="覆盖模板里的 --pack（pack 目录）；换模型文件时与 --native 一起换（make_pack.py 2 秒写一个）")
     ap.add_argument("--mmproj", default=None,
                     help="覆盖模板里的 vision.mmproj（视觉编码器权重）")
     ap.add_argument("--vision", default=None, choices=["off", "cpu", "gpu"],
@@ -208,6 +210,11 @@ def build_cfg(a: argparse.Namespace, engine_log: Path) -> dict:
         else:
             args += ["--native", a.native]
         cfg["model_name"] = Path(a.native).stem.lower().replace(".", "-")
+    if a.pack:                                    # 换 GGUF 就得换 pack：否则 dense/索引与专家对不上
+        if "--pack" in args:
+            args[args.index("--pack") + 1] = a.pack
+        else:
+            args = ["--pack", a.pack] + args
     cfg["args"] = args
     if a.chat_template:                       # 模板覆盖：服务端读 cfg["chat_template_file"]
         cfg["chat_template_file"] = str(Path(a.chat_template).resolve())

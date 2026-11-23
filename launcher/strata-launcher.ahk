@@ -95,6 +95,7 @@ global gParams := {}              ; 最近一次完整的参数集合（简洁�
 global gPro := 0                  ; 专业模式窗口
 global gSimple := 0               ; 简洁模式窗口
 global gAbout := 0                ; 「关于」窗口
+global gPack := ""                ; 本次实际用的 pack 目录（"" = 沿用模板里的 --pack）
 global gLastBasePort := -1        ; 简洁模式里 base_url / 网页聊天链接上次用的端口
 global SIMPLE_W := 460            ; 简洁模式窗口尺寸 + 浏览器那一行的位置（自检会检查它离底部有留白）
 global SIMPLE_H := 552            ; 486 + 66：多了「模型」分组（GGUF / mmproj 两行）
@@ -1051,6 +1052,114 @@ UpdateVisionEnabled() {
     }
 }
 
+; ---------------------------------------------------------------- 0d. pack 发现与校验
+; pack 是"稠密权重 + 索引 + tokenizer + 专家偏移表"，一个 GGUF 一个 pack（约 65 MB，3 秒能造）。
+; 换量化必须同时换 pack：native_experts.txt 头里写明了它指向哪个 GGUF 文件，我们靠这个匹配。
+TemplatePack() {                          ; 模板里的 --pack（未展开的 %变量% 视为没有）
+    global BASE_CFG
+    if (BASE_CFG = "" || !FileExist(BASE_CFG))
+        return ""
+    try {
+        if (RegExMatch(FileRead(BASE_CFG, "UTF-8"), '"--pack"\s*,\s*"([^"]*)"', &m)) {
+            v := Trim(m[1])
+            return (v != "" && !InStr(v, "%")) ? v : ""
+        }
+    }
+    return ""
+}
+
+PackHeaderGguf(packDir) {                 ; native_experts.txt 第一行 -> 它指向的 GGUF 文件名
+    f := packDir . "\native_experts.txt"
+    if !FileExist(f)
+        return ""
+    try {
+        head := StrSplit(FileRead(f, "UTF-8"), "`n")[1]
+        if RegExMatch(head, "absolute offsets in ([^,;)]+)", &m)
+            return Trim(m[1])
+    }
+    return ""
+}
+
+PacksRoot() {                             ; pack 根目录：模板 --pack 的上一级；否则 <HOME>\packs
+    global DEV
+    p := TemplatePack()
+    if (p = "")
+        return DEV . "\packs"
+    p := StrReplace(p, "/", "\")      ; 模板里的路径可能是正斜杠
+    return ParentDir(p)
+}
+
+FindPackFor(gguf, rootOverride := "") {    ; 按"头里点名的文件"找，不依赖目录命名
+    packsDir := (rootOverride != "") ? rootOverride : PacksRoot()
+    if (gguf = "" || !DirExist(packsDir))
+        return ""
+    want := StrLower(BaseName(gguf))
+    loop files, packsDir . "\*", "D" {
+        if (StrLower(PackHeaderGguf(A_LoopFileFullPath)) = want)
+            return A_LoopFileFullPath
+    }
+    ; 命名约定兜底：<family>-<quant>
+    stem := RegExReplace(BaseName(gguf), "(?i)\.gguf$", "")
+    if RegExMatch(stem, "((?:UD-)?(?:IQ\d[A-Za-z0-9_]*|Q\d(?:_[A-Za-z0-9]+)*))$", &m) {
+        cand := packsDir . "\qwen36-" . StrLower(m[1])
+        if DirExist(cand)
+            return cand
+    }
+    return ""
+}
+
+EffectivePack() {                         ; 本次实际会用的 pack
+    global gPack
+    return (gPack != "") ? gPack : TemplatePack()
+}
+
+PackProblem(o) {                           ; "" = 没问题；否则是要拦下来的原因（o 由调用方传，避免依赖界面控件）
+    native := Prop(o, "native", "")
+    if (native = "")
+        return ""                         ; 完全没指定 GGUF 由另一条提醒负责
+    pack := EffectivePack()
+    if (pack = "")
+        return "没有可用的 pack：GGUF「" . BaseName(native) . "」要先做一个 pack（约 3 秒 / 65 MB，菜单「关于 → 准备 pack」或 make_pack.py）"
+    if !DirExist(pack)
+        return "pack 目录不存在: " . pack
+    named := PackHeaderGguf(pack)
+    if (named != "" && StrLower(named) != StrLower(BaseName(native)))
+        return "pack 与模型不匹配：pack 指向「" . named . "」，当前 GGUF 是「" . BaseName(native)
+            . "」。换量化必须同时换 pack，否则输出会是乱码。"
+    return ""
+}
+
+; 给某个 GGUF 现做一个 pack（make_pack.py 实测 2-3 秒 / 65 MB）
+MakePackFor(gguf, packsRoot := "") {
+    global PY, ROOT, DEV
+    ; make_pack.py 在 TinyStrata 自己的 tools/ 里（也可能被拷到 checkout 的 tools/）
+    tool := FirstFile(ROOT . "\tools\make_pack.py", DEV . "\tools\make_pack.py",
+                      A_ScriptDir . "\tools\make_pack.py")
+    if (tool = "")
+        return {ok: false, why: "找不到 make_pack.py（应该在 TinyStrata 的 tools\\ 目录里）"}
+    if (PY = "" || !FileExist(PY))
+        return {ok: false, why: "没有可用的 python（" . PY . "）"}
+    packsDir := (packsRoot != "") ? packsRoot : PacksRoot()
+    try DirCreate(packsDir)
+    SetStatusText("正在生成 pack（约 3 秒）…", "000080")
+    logFile := RESULTS . "\make-pack.log"
+    try DirCreate(RESULTS)
+    ; 引号层次与 BuildLaunchCmd 一致：内层整体包一层引号，否则 cmd /c 会把 python 参数剥坏（rc=1）
+    inner := Q(PY) . " -X utf8 " . Q(tool) . " --gguf " . Q(gguf) . " --packs " . Q(packsDir)
+    cmd := Q(A_ComSpec) . " /c " . Q(inner . " > " . Q(logFile) . " 2>&1")
+    try {
+        rc := RunWait(cmd, , "Hide")      ; AHK v2：RunWait 直接返回退出码
+    } catch as e {
+        return {ok: false, why: e.Message}
+    }
+    if (rc != 0)
+        return {ok: false, why: "make_pack.py 退出码 " . rc . "（日志 " . logFile . "）"}
+    pk := FindPackFor(gguf, packsDir)          ; 只在刚生成的那个根里找，别抓到别处的旧 pack
+    if (pk = "")
+        return {ok: false, why: "生成完了但没在 " . packsDir . " 里找到匹配的 pack"}
+    return {ok: true, pack: pk}
+}
+
 PickNative() {
     global nativeE, sNativeE
     ; 两个界面各有一份展示框：起始目录取其中已经选过的那个
@@ -1067,7 +1176,32 @@ PickNative() {
         nativeE.Value := f
     if IsObject(sNativeE)
         sNativeE.Value := f
-    Tip("GGUF: " . BaseName(f))
+
+    ; 换 GGUF 就得同时换 pack：先按 native_experts.txt 头里的文件名找，找不到就问要不要现做
+    global gPack
+    gPack := ""
+    pk := FindPackFor(f)
+    if (pk != "") {
+        gPack := pk
+        SetStatusText("GGUF: " . BaseName(f) . "  ·  pack: " . BaseName(pk), "000080")
+        Tip("GGUF: " . BaseName(f) . "`npack: " . BaseName(pk))
+        return
+    }
+    msg := "这个 GGUF 还没有 pack（模型换量化就必须有对应 pack，否则输出是乱码）。`n`n"
+         . "现在生成吗？实测约 3 秒、65 MB（专家仍留在 GGUF 里，不会被复制）。`n`n" . f
+    if (MsgBox(Tf(msg), Tf("TinyStrata 启动器") . " - pack", "Icon? 0x4") != "Yes") {
+        SetStatusText("GGUF: " . BaseName(f) . "  ·  缺 pack（启动会被拦下）", "C00000")
+        return
+    }
+    r := MakePackFor(f)
+    if r.ok {
+        gPack := r.pack
+        SetStatusText("GGUF: " . BaseName(f) . "  ·  已生成 pack: " . BaseName(r.pack), "006400")
+        Tip("pack 已生成: " . BaseName(r.pack))
+    } else {
+        MsgBox(Tf("pack 生成失败：`n") . r.why, Tf("TinyStrata 启动器") . " - pack", "Icon!")
+        SetStatusText("pack 生成失败：" . r.why, "C00000")
+    }
 }
 
 ; 选 mmproj（覆盖 vision.mmproj）
@@ -1236,6 +1370,8 @@ BuildArgs(o, addCheck) {
         a.Push("--base", Prop(o, "template", ""))
     if (Prop(o, "native", "") != "")
         a.Push("--native", Prop(o, "native", ""))
+    if (Prop(o, "pack", "") != "")
+        a.Push("--pack", Prop(o, "pack", ""))     ; 换 GGUF 时必须同时换 pack
     if (Prop(o, "mmproj", "") != "")
         a.Push("--mmproj", Prop(o, "mmproj", ""))
     if (Prop(o, "chat_template", "") != "")
@@ -1594,6 +1730,9 @@ Preflight(o, addCheck) {
     ; 没指定 GGUF：如果模板里也没有 --native，引擎会直接起不来 —— 给个明确提醒
     if (Prop(o, "native", "") = "" && !TemplateHasNative())
         warns.Push("没有指定 GGUF 模型文件：用「选择…」（简洁模式也有）选一次，或把配置模板里的 --native / 环境变量设好")
+    pp := PackProblem(o)
+    if (pp != "")
+        problems.Push(pp)
     v := ValidateNumbers(o)
     if !v.ok
         problems.Push("参数错误: " . v.msg)
@@ -2901,6 +3040,29 @@ Selftest() {
         Normalize({mmproj: "C:\\m\\x.gguf", vision: "off"}).vision)
     try FileDelete(tmpCfg)
 
+    SelfSay("`n--- 6e. pack 与 GGUF 的匹配 ---")
+    tp := TemplatePack()
+    SelfCheck("模板里有 --pack", tp != "", tp)
+    if (tp != "" && FileExist(tp . "\native_experts.txt")) {
+        hdr := PackHeaderGguf(tp)
+        SelfCheck("读到 pack 头里的 GGUF 名", hdr != "", hdr)
+        SelfCheck("PackProblem 对匹配的组合返回空", PackProblem({native: hdr}) = "",
+            PackProblem({native: hdr}))
+        bad := PackProblem({native: "Something-Else-UD-IQ4_XS.gguf"})
+        SelfCheck("PackProblem 揪出不匹配", InStr(bad, "不匹配") > 0, bad)
+        SelfCheck("FindPackFor 能按头里的文件名找到 pack",
+            StrLower(StrReplace(FindPackFor(hdr), "/", "\")) = StrLower(StrReplace(tp, "/", "\")),
+            FindPackFor(hdr))
+        SelfCheck("FindPackFor 对未知 GGUF 返回空", FindPackFor("No-Such-UD-Q9_K.gguf") = "",
+            FindPackFor("No-Such-UD-Q9_K.gguf"))
+    } else {
+        SelfSay("    （本机没有带 native_experts.txt 的模板 pack，跳过匹配检查）")
+    }
+    SelfCheck("没有 pack 时 PackProblem 会明说", InStr(PackProblem({native: "x.gguf"}), "pack") > 0,
+        PackProblem({native: "x.gguf"}))
+    SelfCheck("没指定 GGUF 时 PackProblem 不掺和", PackProblem({native: ""}) = "",
+        PackProblem({native: ""}))
+
     SelfSay("`n--- 7. 界面字段往返（建一个隐藏窗口，SetFields -> CollectFields -> 命令行） ---")
     try {
         hg := BuildGui()                      ; 只建不 Show：界面上不弹窗
@@ -3118,6 +3280,15 @@ if (A_Args.Length >= 1 && A_Args[1] = "--selftest") {
     OnError(SelftestError)
     Selftest()
     ExitApp(0)
+}
+
+if (A_Args.Length >= 2 && A_Args[1] = "--packtest") {
+    ; 手测/支持用：给一个 GGUF 现做 pack（第三个参数可指定 packs 根目录）
+    pkRoot := (A_Args.Length >= 3) ? A_Args[3] : ""     ; 别叫 root：AHK 不区分大小写，会覆盖全局 ROOT
+    r := MakePackFor(A_Args[2], pkRoot)
+    msg := r.ok ? ("OK  " . r.pack) : ("FAIL  " . r.why)
+    FileAppend(msg . "`n", A_ScriptDir . "\strata-launcher-packtest.txt", "UTF-8")
+    ExitApp(r.ok ? 0 : 1)
 }
 
 if (A_Args.Length >= 1 && A_Args[1] = "--about") {

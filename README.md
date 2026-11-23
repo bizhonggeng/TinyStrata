@@ -118,12 +118,47 @@ The folder name is yours to pick: the launcher finds the engine by itself (§4.5
 CLI driver knows its own location (`tools/strata-run.py` -> its parent is `<install>`).
 For a different layout, set `STRATA_HOME` / `STRATA_ROOT` (§5.3).
 
-### 4.3 Build the pack once
+### 4.3 The pack: what it is, and why a new model needs a new one
+
+The engine does not read a GGUF directly: it wants a "pack". A pack is **not a copy of the model**:
+
+```
+<packs>/qwen36-UD-IQ3_S/
+  dense.bin            53 MB   non-expert weights in the engine's layout
+  index.txt            52 KB   the index of 613 tensors
+  native_experts.txt    4 KB   * byte offsets of every layer's experts inside the GGUF
+  tokenizer\          9.7 MB
+  conversions.json / compat-bf16.json   quant conversion notes
+```
+
+The 12 GiB of routed experts stay in the GGUF and are read in place, which is why a pack takes
+**3 s / 65 MB** (measured on the 15.3 GB UD-IQ3_S file). Three ways to get one:
+
+**A. Use the prebuilt pack from Releases (no dependencies)**
+
+`Releases -> pack-qwen36-UD-IQ3_S.zip` (43.7 MB) matches `UD-IQ3_S`. Unzip it into the **parent**
+of the template's `--pack` (default `<install>\packs\`), so you end up with
+`<install>\packs\qwen36-UD-IQ3_S\dense.bin ...`.
+
+**B. Let the launcher build it (3 s)**
+
+Pick a GGUF in the launcher: it looks for a pack whose `native_experts.txt` names that file. If
+there is none it asks whether to build one -- yes, and it is prepared and wired up on the spot
+(log in `<install>\results\make-pack.log`).
+
+**C. Command line**
 
 ```powershell
-cd <install>\strata
-python setup.py --family qwen36 --model UD-IQ3_S
+python tools\make_pack.py --gguf <your.gguf> --packs <install>\packs
 ```
+
+> **A different quant needs a different pack.** `native_experts.txt` records which GGUF file it
+> points into; pairing the IQ3_S pack with an IQ4_XS model reads garbage without an error. The
+> launcher now compares the two names before starting and refuses when they differ.
+
+(`setup.py --family qwen36 --model UD-IQ3_S` is the full-wizard route: it downloads the model,
+builds the pack, picks the MTP layer and writes a config -- convenient from zero, slower than A/B/C
+when the only thing missing is the pack.)
 
 ### 4.4 Configure the template
 
@@ -266,6 +301,8 @@ The patches are authored as `strata-4gb <strata-4gb@localhost>`; after applying,
   uploader, run the three-step check in
   [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md): `qwen35moe` +
   `block_count 41` + an MTP-named file / `strata_inspect.py` printing `with an MTP layer`.
+- **Matching pack**: `UD-IQ3_S` uses `pack-qwen36-UD-IQ3_S.zip` from Releases (43.7 MB);
+  any other quant: `tools/make_pack.py` builds one in 3 s / 65 MB -- see §4.3.
 - Model licence: this Unsloth GGUF is Apache-2.0. Weights are not part of this repository.
 
 ---
