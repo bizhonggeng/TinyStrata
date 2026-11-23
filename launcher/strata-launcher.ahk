@@ -97,10 +97,10 @@ global gSimple := 0               ; 简洁模式窗口
 global gAbout := 0                ; 「关于」窗口
 global gLastBasePort := -1        ; 简洁模式里 base_url / 网页聊天链接上次用的端口
 global SIMPLE_W := 460            ; 简洁模式窗口尺寸 + 浏览器那一行的位置（自检会检查它离底部有留白）
-global SIMPLE_H := 486
+global SIMPLE_H := 552            ; 486 + 66：多了「模型」分组（GGUF / mmproj 两行）
 global PRO_W := 1260              ; 专业模式窗口尺寸（左栏参数 704 + 右栏状态/日志 520 + 边距；自检会检查）
 global PRO_H := 520              ; 两栏布局：左栏到 508，右栏日志到 512（约 14 行，自动换行）
-global S_BASE_Y := 380            ; 「接口地址」那行的复制按钮 y
+global S_BASE_Y := 500            ; 「接口地址」那行的复制按钮 y（模型分组后整体下移 92）
 global S_BASE_H := 26
 ; 下拉框允许的取值（AHK v2.0.19 里 DropDownList 的 .Value 是"下标"不是文本，
 ; 所以：设置用 .Text，读取用 .Text；.Value 只在 Radio/CheckBox 上用 0/1）
@@ -1000,27 +1000,56 @@ TemplateToParams(path) {
     return ""
 }
 
+; 模板配置里是否已经有一个“真”的 --native（不是空、也不是未展开的 %占位符%）
+; 用来避免“用户没选 GGUF 但其实模板已经指定了”这种假警报。
+TemplateHasNative() {
+    global BASE_CFG
+    if (BASE_CFG = "" || !FileExist(BASE_CFG))
+        return false
+    try {
+        s := FileRead(BASE_CFG, "UTF-8")
+        if (RegExMatch(s, '"--native"\s*,\s*"([^"]*)"', &m))
+            return (Trim(m[1]) != "" && !InStr(m[1], "%"))
+    }
+    return false
+}
+
 ; 选 GGUF（覆盖 --native；换模型文件时 pack 也要匹配，通常同时换模板）
 PickNative() {
-    global nativeE
-    cur := Trim(nativeE.Value)
+    global nativeE, sNativeE
+    ; 两个界面各有一份展示框：起始目录取其中已经选过的那个
+    cur := ""
+    if IsObject(sNativeE) && Trim(sNativeE.Value) != ""
+        cur := Trim(sNativeE.Value)
+    else if IsObject(nativeE) && Trim(nativeE.Value) != ""
+        cur := Trim(nativeE.Value)
     start := (cur != "" && FileExist(cur)) ? cur : ""
     f := FileSelect(1, start, "选 GGUF 模型文件（--native）", "GGUF (*.gguf)")
     if (f = "")
         return
-    nativeE.Value := f
+    if IsObject(nativeE)
+        nativeE.Value := f
+    if IsObject(sNativeE)
+        sNativeE.Value := f
     Tip("GGUF: " . BaseName(f))
 }
 
 ; 选 mmproj（覆盖 vision.mmproj）
 PickMmproj() {
-    global mmprojE
-    cur := Trim(mmprojE.Value)
+    global mmprojE, sMmprojE
+    cur := ""
+    if IsObject(sMmprojE) && Trim(sMmprojE.Value) != ""
+        cur := Trim(sMmprojE.Value)
+    else if IsObject(mmprojE) && Trim(mmprojE.Value) != ""
+        cur := Trim(mmprojE.Value)
     start := (cur != "" && FileExist(cur)) ? cur : ""
     f := FileSelect(1, start, "选视觉编码器 mmproj", "GGUF (*.gguf)")
     if (f = "")
         return
-    mmprojE.Value := f
+    if IsObject(mmprojE)
+        mmprojE.Value := f
+    if IsObject(sMmprojE)
+        sMmprojE.Value := f
     Tip("mmproj: " . BaseName(f))
 }
 
@@ -1516,6 +1545,9 @@ Preflight(o, addCheck) {
         problems.Push("驱动缺失: " . DRIVER)
     if !FileExist(BASE_CFG)
         problems.Push("模板配置缺失: " . BASE_CFG)
+    ; 没指定 GGUF：如果模板里也没有 --native，引擎会直接起不来 —— 给个明确提醒
+    if (Prop(o, "native", "") = "" && !TemplateHasNative())
+        warns.Push("没有指定 GGUF 模型文件：用「选择…」（简洁模式也有）选一次，或把配置模板里的 --native / 环境变量设好")
     v := ValidateNumbers(o)
     if !v.ok
         problems.Push("参数错误: " . v.msg)
@@ -2237,6 +2269,7 @@ CopyWithFeedback(btn, text, label, emptyMsg := "") {
 
 SimpleCollect() {
     global sCtxE, sPortE, sKeyE, sThinkCB, sPresCB, sShortR, sLongR, gParams, sVisD, sVisTokE
+    global sNativeE, sMmprojE
     o := Normalize(gParams)                  ; 隐藏字段用基准集合里的原值
     o.mode := (sLongR.Value ? "long" : "short")
     o.ctx := IntOr(sCtxE.Value, o.ctx)
@@ -2244,6 +2277,8 @@ SimpleCollect() {
     o.thinking := (sThinkCB.Value ? "on" : "off")
     o.preserve := (sPresCB.Value ? "on" : "off")
     o.apikey := Trim(sKeyE.Value)
+    o.native := Trim(sNativeE.Value)          ; 简洁模式也能指定 GGUF（空 = 用模板里的 --native）
+    o.mmproj := Trim(sMmprojE.Value)
     o.vision := DdlText(sVisD, "cpu")
     o.vision_tokens := Trim(sVisTokE.Value, " `t`r`n")
     o.tag := (o.mode = "long" ? "long" : "")
@@ -2253,10 +2288,13 @@ SimpleCollect() {
 
 SetSimpleFields(o) {
     global sCtxE, sPortE, sKeyE, sThinkCB, sPresCB, sShortR, sLongR, sVisD, sVisTokE
+    global sNativeE, sMmprojE
     o := Normalize(o)
     sCtxE.Value := String(o.ctx)
     sPortE.Value := String(o.port)
     sKeyE.Value := o.apikey
+    sNativeE.Value := Prop(o, "native", "")
+    sMmprojE.Value := Prop(o, "mmproj", "")
     sThinkCB.Value := (o.thinking = "on")
     sPresCB.Value := (o.preserve = "on")
     sVisD.Text := InList(Prop(o, "vision", "cpu"), VISION_LIST, "cpu")
@@ -2379,40 +2417,51 @@ BuildSimpleGui() {
     sShortR.OnEvent("Click", (*) => ApplyPreset("short"))
     sLongR.OnEvent("Click", (*) => ApplyPreset("long"))
 
-    sg.AddGroupBox("x8 y100 w444 h152", "参数")
-    sg.AddText("x22 y130 w70", "上下文长度")
-    sCtxE := sg.AddEdit("x96 y126 w86", "20480")
-    sg.AddText("x198 y130 w34", "端口")
-    sPortE := sg.AddEdit("x236 y126 w76", "1339")
-    sThinkCB := sg.AddCheckBox("x22 y162 w110", "启用思考")
-    sPresCB := sg.AddCheckBox("x150 y162 w170", "preserve-thinking")
-    sg.AddText("x22 y194 w56", "api-key")
-    sKeyE := sg.AddEdit("x82 y190 w214")
-    sCopyKey := sg.AddButton("x302 y190 w84 h26", "复制")
-    sg.AddText("x22 y222 w56", "图片")
-    sVisD := sg.AddDropDownList("x82 y218 w76", VISION_LIST)
-    sg.AddText("x166 y222 w50", "图tok")
-    sVisTokE := sg.AddEdit("x220 y218 w50", "300")
-    sg.AddText("x278 y222 w170 c404040", "cpu=不占显存（推荐）")
+    ; 模型：新用户/便携包最需要这两行 —— 没它们，简洁模式根本没法指定已下载的 GGUF
+    sg.AddGroupBox("x8 y100 w444 h84", "模型")
+    sg.AddText("x22 y124 w44", "GGUF")
+    sNativeE := sg.AddEdit("x70 y120 w268 h24 ReadOnly", "")
+    sNativeE.SetFont("s8")
+    sg.AddButton("x344 y118 w104 h26", "选择…").OnEvent("Click", (*) => PickNative())
+    sg.AddText("x22 y156 w44", "mmproj")
+    sMmprojE := sg.AddEdit("x70 y152 w268 h24 ReadOnly", "")
+    sMmprojE.SetFont("s8")
+    sg.AddButton("x344 y150 w104 h26", "选择…").OnEvent("Click", (*) => PickMmproj())
+
+    sg.AddGroupBox("x8 y192 w444 h152", "参数")
+    sg.AddText("x22 y222 w70", "上下文长度")
+    sCtxE := sg.AddEdit("x96 y218 w86", "20480")
+    sg.AddText("x198 y222 w34", "端口")
+    sPortE := sg.AddEdit("x236 y218 w76", "1339")
+    sThinkCB := sg.AddCheckBox("x22 y254 w110", "启用思考")
+    sPresCB := sg.AddCheckBox("x150 y254 w170", "preserve-thinking")
+    sg.AddText("x22 y286 w56", "api-key")
+    sKeyE := sg.AddEdit("x82 y282 w214")
+    sCopyKey := sg.AddButton("x302 y282 w84 h26", "复制")
+    sg.AddText("x22 y318 w56", "图片")
+    sVisD := sg.AddDropDownList("x82 y314 w76", VISION_LIST)
+    sg.AddText("x166 y318 w50", "图tok")
+    sVisTokE := sg.AddEdit("x220 y314 w50", "300")
+    sg.AddText("x278 y318 w170 c404040", "cpu=不占显存（推荐）")
     sCopyKey.OnEvent("Click", (*) => CopyWithFeedback(sCopyKey, sKeyE.Value, "复制", "api-key 为空"))
     sCtxE.OnEvent("Change", (*) => (UpdateSimpleDerived(IntOr(sPortE.Value, 1339)), UpdateProBoundary()))
     sPortE.OnEvent("Change", (*) => UpdateSimpleDerived(IntOr(sPortE.Value, 1339)))
 
-    sg.AddGroupBox("x8 y260 w444 h48", "运行状态")
-    sBadge := sg.AddText("x22 y280 w410 h20 c808080", "○  未运行")   ; 与其它文字同号，只靠颜色区分
+    sg.AddGroupBox("x8 y352 w444 h48", "运行状态")
+    sBadge := sg.AddText("x22 y372 w410 h20 c808080", "○  未运行")   ; 与其它文字同号，只靠颜色区分
 
-    sg.AddButton("x22 y320 w84 h36", "启动").OnEvent("Click", (*) => DoLaunch(false))
-    sg.AddButton("x112 y320 w84 h36", "重启").OnEvent("Click", (*) => DoRestart())
-    sg.AddButton("x202 y320 w72 h36", "停止").OnEvent("Click", (*) => DoStop())
-    sg.AddButton("x280 y320 w72 h36", "刷新").OnEvent("Click", (*) => RefreshStatus())
-    sg.AddButton("x352 y320 w90 h36", "保存为默认").OnEvent("Click", (*) => SaveIni(CollectCurrent()))
+    sg.AddButton("x22 y412 w84 h36", "启动").OnEvent("Click", (*) => DoLaunch(false))
+    sg.AddButton("x112 y412 w84 h36", "重启").OnEvent("Click", (*) => DoRestart())
+    sg.AddButton("x202 y412 w72 h36", "停止").OnEvent("Click", (*) => DoStop())
+    sg.AddButton("x280 y412 w72 h36", "刷新").OnEvent("Click", (*) => RefreshStatus())
+    sg.AddButton("x352 y412 w90 h36", "保存为默认").OnEvent("Click", (*) => SaveIni(CollectCurrent()))
 
-    sg.AddGroupBox("x8 y366 w444 h74", "浏览器")
-    sChatLink := sg.AddLink("x22 y386 w300 h24 cBlue", "打开网页聊天")   ; 建 Link 时必须给文字/宽度，
+    sg.AddGroupBox("x8 y458 w444 h74", "浏览器")
+    sChatLink := sg.AddLink("x22 y478 w300 h24 cBlue", "打开网页聊天")   ; 建 Link 时必须给文字/宽度，
     sChatLink.SetFont("s10")                                         ; 空文字建的 Link 宽 0，之后设 Text 也显不出来
-    sg.AddText("x22 y416 w60", "接口地址")
-    sBaseE := sg.AddText("x86 y414 w250", "")          ; 用 Text 而不是只读 Edit：只读 Edit 会被系统当作
-    sCopyBase := sg.AddButton("x344 y408 w70 h26", "复制")   ; 首个可聚焦控件，一打开就是"整段被选中"的样子
+    sg.AddText("x22 y508 w60", "接口地址")
+    sBaseE := sg.AddText("x86 y506 w250", "")          ; 用 Text 而不是只读 Edit：只读 Edit 会被系统当作
+    sCopyBase := sg.AddButton("x344 y500 w70 h26", "复制")   ; 首个可聚焦控件，一打开就是"整段被选中"的样子
     sCopyBase.OnEvent("Click", (*) => CopyWithFeedback(sCopyBase, sBaseE.Text, "复制"))
 
     gSimple := sg
@@ -2853,10 +2902,30 @@ Selftest() {
             "LINK_Y=" . LINK_Y . " 框=" . LINK_BOX_Y . ".." . (LINK_BOX_Y + 56))
         ; ---- 简洁模式：同一份参数集合的另一个视图 ----
         SelfSay("    简洁模式：")
+        ; 简洁窗口必须有 GGUF / mmproj 的入口：新用户下完模型就能直接选
+        nBtn := 0
+        for c in gSimple {
+            try {
+                if (c.Type = "Button" && InStr(c.Text, Tf("选择…")))
+                    nBtn++
+            }
+        }
+        SelfCheck("简洁模式有「选择…」按钮（GGUF/mmproj 入口）", nBtn >= 2, "按钮数=" . nBtn)
+        SelfCheck("简洁模式 GGUF/mmproj 输入框存在",
+            IsObject(sNativeE) && IsObject(sMmprojE),
+            "native=" . (IsObject(sNativeE) ? "有" : "无") . " mmproj=" . (IsObject(sMmprojE) ? "有" : "无"))
         lp := ModePreset("long")
+        lp.native := "C:\\models\\demo-UD-IQ3_S.gguf"
+        lp.mmproj := "C:\\models\\demo-mmproj-F32.gguf"
         gParams := lp
         SetSimpleFields(lp)
         c2 := SimpleCollect()
+        SelfCheck("简洁模式：GGUF/mmproj 往返一致",
+            (c2.native = lp.native) && (c2.mmproj = lp.mmproj),
+            c2.native . " | " . c2.mmproj)
+        SelfCheck("简洁模式窗口能完整显示（SIMPLE_H × DPI + 边框 <= 屏幕物理高）",
+            (SIMPLE_H * A_ScreenDPI / 96 + 80) <= A_ScreenHeight,
+            "SIMPLE_H=" . SIMPLE_H . " dpi=" . A_ScreenDPI . " 屏高=" . A_ScreenHeight)
         SelfCheck("简洁模式：往返一致（mode/ctx/port/thinking/preserve）",
             (c2.mode = lp.mode) && (c2.ctx = lp.ctx) && (c2.port = lp.port)
             && (c2.thinking = lp.thinking) && (c2.preserve = lp.preserve),
