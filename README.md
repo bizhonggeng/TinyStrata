@@ -1,5 +1,7 @@
 # TinyStrata
 
+<img src="assets/icon.png" width="96" align="right" alt="TinyStrata">
+
 [简体中文](README.zh-CN.md) | [English](README.md)
 
 ---
@@ -106,24 +108,28 @@ Get-Content strata.exe.sha256
 ### 4.2 Put the files in place
 
 ```powershell
-copy strata.exe D:\dev\strata\engine-cuda12\strata.exe
-copy strata-launcher.ahk D:\dev\
-copy strata-run.py D:\dev\tools\
+# <install> = wherever you put TinyStrata, e.g. C:\TinyStrata (used below)
+copy strata.exe              <install>\strata\engine-cuda12\strata.exe
+copy TinyStrata-Launcher.exe <install>\
+copy strata-run.py           <install>\tools\
 ```
 
-Another layout is fine — only two constants change (§5.3).
+The folder name is yours to pick: the launcher finds the engine by itself (§4.5) and the
+CLI driver knows its own location (`tools/strata-run.py` -> its parent is `<install>`).
+For a different layout, set `STRATA_HOME` / `STRATA_ROOT` (§5.3).
 
 ### 4.3 Build the pack once
 
 ```powershell
-cd D:\dev\strata
+cd <install>\strata
 python setup.py --family qwen36 --model UD-IQ3_S
 ```
 
 ### 4.4 Configure the template
 
-Copy `configs/strata-qwen36-iq3s.example.json` to `D:\dev\strata-qwen36-iq3s.json` and fix its
-`--pack` / `--native` / `--mtp` / `--expert-profile` paths.
+Copy `configs/strata-qwen36-iq3s.example.json` to `<install>\strata-qwen36-iq3s.json`.
+The template uses **environment-variable placeholders** (`%STRATA_ROOT%` / `%STRATA_PACKS%` /
+`%STRATA_MODELS%` ...): either set them (see `configs/README.md`) or edit the paths in place.
 
 ### 4.5 Start a mode
 
@@ -147,8 +153,8 @@ python tools/strata-run.py --ctx 20480 --kv k8v4 --vram-reserve-mib 64 --mtp on 
 ### 4.6 Check the two flags that matter
 
 ```powershell
-D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
-D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
+<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
+<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
 ```
 
 Both lines must appear. A binary built from upstream **without** these patches prints nothing.
@@ -185,26 +191,36 @@ Every change is small and commented: `src/core/mtp.cpp` (expert offload),
 `serve/` (autosave, log timestamps). Re-export the patches with:
 
 ```bash
-cd D:/dev/strata
-git format-patch -q cd1daa4e..HEAD -o ../dist/TinyStrata/patches --no-signature
+cd <install>/strata
+git format-patch -q cd1daa4e..HEAD -o /path/to/TinyStrata/patches --no-signature
 ```
 
-### 5.3 Expected layout
+### 5.3 Layout
 
-The scripts assume this layout; `DEV` (top of `tools/strata-run.py` and the launcher) and `ROOT`
-are the only two constants to change.
+Default layout (pick any folder name; `<install>` is where the launcher and the driver live):
 
 ```
-D:\dev\
+<install>\
 ├── strata\                     upstream checkout, engine in strata\engine-cuda12\strata.exe
-├── tools\strata-run.py         the driver
-├── configs\strata-qwen36-iq3s.example.json   copy to strata-qwen36-iq3s.json and fix the paths
+├── tools\strata-run.py         the driver (its parent is <install>)
+├── configs\strata-qwen36-iq3s.example.json   copy to strata-qwen36-iq3s.json
 ├── results\                    logs land here
 └── sessions\                   autosave .sess files (set "slot_save_path")
 
-E:\models\unsloth\Qwen3.6-35B-A3B-MTP-GGUF\   the GGUF (+ mmproj-F32.gguf for images)
-E:\Strata-data\packs\qwen36-UD-IQ3_S\         the pack setup.py builds
+<models>\Qwen3.6-35B-A3B-MTP-GGUF\           the GGUF (+ mmproj-F32.gguf for images)
+<packs>\qwen36-UD-IQ3_S\                    the pack setup.py builds
 ```
+
+This layout is a **default, not a hard-coded path**. Three ways to move things:
+
+| Knob | What it does |
+|---|---|
+| env `STRATA_HOME` | the whole `<install>` root (config, logs, sessions follow) |
+| env `STRATA_ROOT` | the upstream checkout only (default `<install>\strata`) |
+| launcher menu "About -> Open engine folder" / the "Browse..." prompt | pick once, remembered in `strata-launcher.ini` |
+
+`<models>` / `<packs>` live in the config template as `%STRATA_MODELS%` / `%STRATA_PACKS%`
+placeholders (see `configs/README.md`).
 
 ---
 

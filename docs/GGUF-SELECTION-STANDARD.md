@@ -156,7 +156,7 @@ nextn_predict_layers: 1      ← 关键：=1 才有 MTP
 
 ```bash
 # 一行判定：架构、几何、量化构成、MTP 是否在位
-D:/dev/strata/.venv/Scripts/python.exe D:/dev/strata/tools/strata_inspect.py <candidate.gguf>
+python tools/strata_inspect.py <candidate.gguf>
 ```
 
 合格的输出长这样（我们现有模型的真实输出）：

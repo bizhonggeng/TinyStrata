@@ -29,12 +29,25 @@ from pathlib import Path
 
 import psutil
 
-DEV = Path(r"D:\dev")
-ROOT = Path(r"D:\dev\strata")
-PY = ROOT / ".venv" / "Scripts" / "python.exe"
-BASE_CFG = DEV / "strata-qwen36-iq3s.json"
+def _resolve_home() -> Path:
+    """Where the TinyStrata install lives.
+
+    Order: $STRATA_HOME -> the directory above this script (tools/../) -> cwd.
+    Nothing here is hard-coded to a developer machine.
+    """
+    env = os.environ.get("STRATA_HOME") or os.environ.get("TINYSTRATA_HOME")
+    if env:
+        return Path(os.path.expandvars(env)).expanduser().resolve()
+    here = Path(__file__).resolve().parent
+    return here.parent if here.name.lower() == "tools" else here
+
+
+DEV = _resolve_home()                                   # config / logs / sessions
+ROOT = Path(os.path.expandvars(os.environ.get("STRATA_ROOT", str(DEV / "strata")))).resolve()
+PY = Path(os.path.expandvars(os.environ.get("STRATA_PYTHON", str(ROOT / ".venv" / "Scripts" / "python.exe"))))
+BASE_CFG = Path(os.path.expandvars(os.environ.get("STRATA_CONFIG", str(DEV / "strata-qwen36-iq3s.json"))))
 RUN_CFG = DEV / "strata-qwen36-run.json"
-GUARD = DEV / "tools" / "strata-ram-guard.py"
+GUARD = Path(os.environ.get("STRATA_GUARD", str(DEV / "tools" / "strata-ram-guard.py")))
 RESULTS = DEV / "results"
 ENGINE_LOG = RESULTS / "strata-qwen36.log"
 SERVER_LOG = RESULTS / "strata-qwen36-server.log"
@@ -142,8 +155,24 @@ def base_cfg_path(a: argparse.Namespace) -> Path:
     return Path(a.base) if a.base else BASE_CFG
 
 
+def _expand(obj):
+    """Expand %VAR% / $VAR in every string of the loaded config.
+
+    The shipped example config is written with placeholders such as
+    %STRATA_ROOT%/engine-cuda12/strata.exe so that nothing in the repo points at a
+    specific machine. Anyone can either edit the file or just set the variables.
+    """
+    if isinstance(obj, str):
+        return os.path.expandvars(obj)
+    if isinstance(obj, list):
+        return [_expand(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _expand(v) for k, v in obj.items()}
+    return obj
+
+
 def build_cfg(a: argparse.Namespace, engine_log: Path) -> dict:
-    cfg = json.loads(base_cfg_path(a).read_text(encoding="utf-8"))
+    cfg = _expand(json.loads(base_cfg_path(a).read_text(encoding="utf-8")))
     over = {"--max-context": str(a.ctx), "--kv": a.kv,
             "--vram-reserve-mib": str(a.vram_reserve_mib),
             "--mtp-draft-vocab": str(ROOT / "data" / DRAFT[a.draft_vocab])}

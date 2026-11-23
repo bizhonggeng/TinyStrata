@@ -7,6 +7,7 @@
 """
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -14,8 +15,16 @@ import time
 import urllib.error
 import urllib.request
 
-DEV = "D:/dev"
-PY = "D:/dev/strata/.venv/Scripts/python.exe"
+def _home() -> Path:
+    env = os.environ.get("STRATA_HOME") or os.environ.get("TINYSTRATA_HOME")
+    if env:
+        return Path(os.path.expandvars(env)).expanduser()
+    here = Path(__file__).resolve().parent
+    return here.parent if here.name.lower() == "tools" else here
+
+
+DEV = _home()
+PY = str(DEV / "strata" / ".venv" / "Scripts" / "python.exe")
 URL = "http://127.0.0.1:1339/v1/chat/completions"
 HEALTH = "http://127.0.0.1:1339/health"
 

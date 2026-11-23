@@ -16,6 +16,7 @@ param(
     [string]$Out    = "D:\dev\dist\TinyStrata\dist\TinyStrata-Launcher.exe",
     [string]$Base   = "C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe",
     [string]$Compiler = "C:\Program Files\AutoHotkey\Compiler\Ahk2Exe.exe",
+    [string]$Icon   = "",      # 空 = 自动在仓库根 assets\ 下找
     [string]$Tag    = "v0.1.0",
     [string]$Repo   = "bizhonggeng/TinyStrata",
     [switch]$NoTest,
@@ -40,7 +41,23 @@ foreach ($n in @("TinyStrata-Launcher", "AutoHotkey64")) {
 # 2) 编译
 New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 Write-Host "[--] 编译 $In"
-& $Compiler /in $In /out $Out /base $Base /compress 2 | Out-Null
+$extra = @()
+if (-not $Icon) {
+    $up = Split-Path $PSScriptRoot -Parent
+    $cands = @((Join-Path $up "assets\icon.ico"),                    # 仓库布局：<root>/assets
+               (Join-Path $up "dist\TinyStrata\assets\icon.ico"),   # 开发布局：<root>/dist/TinyStrata/assets
+               (Join-Path $PSScriptRoot "assets\icon.ico"))
+    foreach ($c in $cands) {
+        if (Test-Path $c) { $Icon = $c; break }
+    }
+}
+if ($Icon -and (Test-Path $Icon)) {
+    $extra = @("/icon", $Icon)
+    Write-Host "[--] 图标 $Icon"
+} else {
+    Write-Host "[!!] 没找到 assets\icon.ico，用默认图标" -ForegroundColor Yellow
+}
+& $Compiler /in $In /out $Out /base $Base /compress 2 @extra | Out-Null
 if (-not (Test-Path $Out)) { Write-Host "[XX] 编译失败" -ForegroundColor Red; exit 1 }
 $f = Get-Item $Out
 $h = (Get-FileHash $Out -Algorithm SHA256).Hash.ToLower()

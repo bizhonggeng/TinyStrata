@@ -1,5 +1,7 @@
 # TinyStrata
 
+<img src="assets/icon.png" width="96" align="right" alt="TinyStrata">
+
 [简体中文](README.zh-CN.md) | [English](README.md)
 
 ---
@@ -99,24 +101,28 @@ Get-Content strata.exe.sha256
 ### 4.2 就位
 
 ```powershell
-copy strata.exe D:\dev\strata\engine-cuda12\strata.exe
-copy strata-launcher.ahk D:\dev\
-copy strata-run.py D:\dev\tools\
+# <install> = 你放 TinyStrata 的目录，例如 C:\TinyStrata（下面都用它当例子）
+copy strata.exe              <install>\strata\engine-cuda12\strata.exe
+copy TinyStrata-Launcher.exe <install>\
+copy strata-run.py           <install>\tools\
 ```
 
-目录可以不一样，只要改两处常量（见 §5.3）。
+目录名字随便取：启动器会自己找引擎（§4.5），命令行驱动也知道自己的位置
+（`tools/strata-run.py` 的上一级就是 `<install>`）。要换布局就用环境变量
+`STRATA_HOME` / `STRATA_ROOT` 显式指定，见 §5.3。
 
 ### 4.3 建一次 pack（必须做一次，之后复用）
 
 ```powershell
-cd D:\dev\strata
+cd <install>\strata
 python setup.py --family qwen36 --model UD-IQ3_S
 ```
 
 ### 4.4 配模板
 
-把 `configs/strata-qwen36-iq3s.example.json` 复制成 `D:\dev\strata-qwen36-iq3s.json`，
-改掉里面的 `--pack` / `--native` / `--mtp` / `--expert-profile` 四个路径。
+把 `configs/strata-qwen36-iq3s.example.json` 复制成 `<install>\strata-qwen36-iq3s.json`。
+模板里用的是**环境变量占位符**（`%STRATA_ROOT%` / `%STRATA_PACKS%` / `%STRATA_MODELS%` …），
+要么把变量设上（见 `configs/README.md`），要么把里面的路径改成你自己的。
 
 ### 4.5 启动
 
@@ -139,8 +145,8 @@ python tools/strata-run.py --ctx 20480 --kv k8v4 --vram-reserve-mib 64 --mtp on 
 ### 4.6 自检两个关键 flag
 
 ```powershell
-D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
-D:\dev\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
+<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
+<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
 ```
 
 两行都得有输出。上游原版编出来的二进制**没有**这两行。
@@ -177,25 +183,36 @@ python setup.py --family qwen36 --model UD-IQ3_S
 `serve/`（autosave、日志时间戳）。重新生成补丁：
 
 ```bash
-cd D:/dev/strata
-git format-patch -q cd1daa4e..HEAD -o ../dist/TinyStrata/patches --no-signature
+cd <install>/strata
+git format-patch -q cd1daa4e..HEAD -o /path/to/TinyStrata/patches --no-signature
 ```
 
-### 5.3 目录假设
+### 5.3 目录布局
 
-脚本假设下面这个布局；`DEV`（`tools/strata-run.py` 顶部和启动器里）和 `ROOT` 是唯一要改的两个常量。
+默认布局（名字随意，下面用 `<install>` 表示启动器/驱动所在目录）：
 
 ```
-D:\dev\
+<install>\
 ├── strata\                     上游检出，引擎在 strata\engine-cuda12\strata.exe
-├── tools\strata-run.py         驱动
-├── configs\strata-qwen36-iq3s.example.json   复制成 strata-qwen36-iq3s.json 并改路径
+├── tools\strata-run.py         驱动（它的上一级就是 <install>）
+├── configs\strata-qwen36-iq3s.example.json   复制成 strata-qwen36-iq3s.json
 ├── results\                    日志落这里
 └── sessions\                   自动存盘的 .sess 文件（配 "slot_save_path"）
 
-E:\models\unsloth\Qwen3.6-35B-A3B-MTP-GGUF\   GGUF（图片还要 mmproj-F32.gguf）
-E:\Strata-data\packs\qwen36-UD-IQ3_S\         setup.py 建出的 pack
+<models>\Qwen3.6-35B-A3B-MTP-GGUF\           GGUF（图片还要 mmproj-F32.gguf）
+<packs>\qwen36-UD-IQ3_S\                    setup.py 建出的 pack
 ```
+
+这套布局是**默认值，不是硬编码**。想换位置有三种办法：
+
+| 办法 | 作用 |
+|---|---|
+| 环境变量 `STRATA_HOME` | 整个 `<install>` 根（配置/日志/会话都跟着走） |
+| 环境变量 `STRATA_ROOT` | 单独指定上游检出目录（默认 `<install>\strata`） |
+| 启动器菜单「关于 → 打开引擎目录」/ 首次「浏览…」 | 选一次就记进 `strata-launcher.ini` |
+
+`<models>` / `<packs>` 写在配置模板里，用 `%STRATA_MODELS%` / `%STRATA_PACKS%` 占位
+（见 `configs/README.md`）。
 
 ---
 

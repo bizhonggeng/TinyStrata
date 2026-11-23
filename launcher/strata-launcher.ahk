@@ -67,7 +67,7 @@ Locate()
 try {
     InitLang()
 } catch as e {
-    FileAppend("i18n init failed: " . e.Message . " @" . e.Line . " (" . e.What . ")" . chr(10), "D:\dev\scratch\i18n-err.txt", "UTF-8")
+    FileAppend("i18n init failed: " . e.Message . " @" . e.Line . " (" . e.What . ")" . chr(10), A_ScriptDir . "\i18n-init-error.txt", "UTF-8")
     gLang := "zh"
 }
 global RAM_ABORT_MB := 500        ; 与驱动内护栏同阈值：余量低于它就杀引擎
@@ -136,7 +136,6 @@ Locate() {
             break
         d := p
     }
-    cands.Push("D:\dev")                     ; 4) 老路径，保证本机行为不变
 
     hit := "", how := ""
     for dir in cands {
@@ -151,7 +150,9 @@ Locate() {
 
     if (hit = "") {
         gLocated := false, gLocateHow := ""
-        DEV := "D:\dev", ROOT := DEV . "\strata"
+        DEV := A_ScriptDir, ROOT := A_ScriptDir          ; 兜底：把启动器所在目录当便携根
+        if DirExist(A_ScriptDir . "\strata")
+            ROOT := A_ScriptDir . "\strata"
         EXE := ROOT . "\engine-cuda12\strata.exe"
         SERVER_PY := ROOT . "\serve\server.py"
     } else {
@@ -2597,7 +2598,7 @@ Selftest() {
     try FileDelete(INI)
     try {
         iniO := ModePreset("short")
-        iniO.chat_template := "D:/dev/templates/froggeric-qwen36.jinja"
+        iniO.chat_template := A_Temp . "\tinystrata-inicheck.jinja"
         iniO.ctx := 20480
         SaveIni(iniO)
         iniBack := LoadSection("short", "short")
@@ -2613,7 +2614,7 @@ Selftest() {
     SelfCheck("chat 模板留空 → 不传 --chat-template",
         InStr(ArgsToStr(BuildArgs(baseNoTpl, false)), "--chat-template") = 0)
     withTpl := ModePreset("short")
-    withTpl.chat_template := "D:\dev\templates\froggeric-qwen36.jinja"
+    withTpl.chat_template := A_Temp . "\tinystrata-inicheck2.jinja"
     withDry := ModePreset("short")
     withDry.dry := "1.5"
     SelfCheck("dry 设了 → 传 --dry-multiplier",

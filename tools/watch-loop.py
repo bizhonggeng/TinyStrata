@@ -24,9 +24,17 @@ import re
 import time
 from pathlib import Path
 
-DEV = Path("D:/dev")
+def _home() -> Path:
+    env = os.environ.get("STRATA_HOME") or os.environ.get("TINYSTRATA_HOME")
+    if env:
+        return Path(os.path.expandvars(env)).expanduser()
+    here = Path(__file__).resolve().parent
+    return here.parent if here.name.lower() == "tools" else here
+
+
+DEV = _home()
 RESULTS = DEV / "results"
-PI_SESSIONS = Path("C:/Users/wuyw/.pi/agent/sessions")
+PI_SESSIONS = Path(os.environ.get("PI_SESSIONS", str(Path.home() / ".pi" / "agent" / "sessions")))
 
 STRATA_PATTERNS = [
     ("LOOP-RECOVERY", re.compile(r"the thinking repeated the same passages \(coverage=([\d.]+)\) at (\d+) tokens")),

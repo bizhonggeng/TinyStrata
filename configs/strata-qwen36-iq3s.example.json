@@ -1,12 +1,12 @@
 {
- "exe": "D:/dev/strata/engine-cuda12/strata.exe",
+ "exe": "%STRATA_ROOT%/engine-cuda12/strata.exe",
  "args": [
   "--pack",
-  "E:/Strata-data/packs/qwen36-UD-IQ3_S",
+  "%STRATA_PACKS%/qwen36-UD-IQ3_S",
   "--native",
-  "E:/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+  "%STRATA_MODELS%/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
   "--expert-profile",
-  "D:/dev/strata/data/expert-profile-qwen36.bin",
+  "%STRATA_ROOT%/data/expert-profile-qwen36.bin",
   "--expert-cache",
   "800",
   "--prefill",
@@ -16,9 +16,9 @@
   "--spec-min-p",
   "0.5",
   "--mtp",
-  "E:/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+  "%STRATA_MODELS%/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
   "--mtp-draft-vocab",
-  "D:/dev/strata/data/draft_vocab_en.bin",
+  "%STRATA_ROOT%/data/draft_vocab_en.bin",
   "--max-context",
   "12288",
   "--kv",
@@ -41,25 +41,25 @@
   "--conversation-cache-slots",
   "12"
  ],
- "cwd": "D:/dev/strata",
- "tokenizer": "E:/Strata-data/packs/qwen36-UD-IQ3_S/tokenizer",
+ "cwd": "%STRATA_ROOT%",
+ "tokenizer": "%STRATA_PACKS%/qwen36-UD-IQ3_S/tokenizer",
  "model_name": "qwen3.6-35b-a3b-ud-iq3_s",
  "cors_origins": [
   "*"
  ],
- "log": "D:/dev/results/strata-qwen36.log",
+ "log": "%STRATA_HOME%/results/strata-qwen36.log",
  "lib_dirs": [
-  "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin"
+  "%CUDA_BIN%"
  ],
  "port": 1339,
  "vision": {
-  "exe": "D:/dev/strata/engine-cuda12/strata-vision.exe",
-  "mmproj": "E:/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/1/mmproj-F32.gguf",
-  "model": "E:/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+  "exe": "%STRATA_ROOT%/engine-cuda12/strata-vision.exe",
+  "mmproj": "%STRATA_MODELS%/Qwen3.6-35B-A3B-MTP-GGUF/mmproj-F32.gguf",
+  "model": "%STRATA_MODELS%/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
   "threads": 8,
   "max_tokens": 300
  },
- "slot_save_path": "D:/dev/sessions",
+ "slot_save_path": "%STRATA_HOME%/sessions",
  "reasoning_loop_recovery": "stop",
  "sampling": {
   "dry_multiplier": 1.5,
