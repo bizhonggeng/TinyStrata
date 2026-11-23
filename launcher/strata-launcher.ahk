@@ -56,7 +56,7 @@ global GUARD_LOG := ""
 global TPL_DIR  := ""
 global gLocated := false  ; Locate() 有没有真的找到 strata.exe
 global gLocateHow := ""   ; 从哪个目录找到的（状态行要显示）
-global APP_VER := "0.1.2"
+global APP_VER := "0.1.3"       ; 与 Release tag 对齐（下一批改动再升 0.1.4）
 global PROJ_URL := "https://github.com/bizhonggeng/TinyStrata"
 global UPSTREAM_URL := "https://github.com/Niko1221/Strata"
 global MODEL_URL := "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"       ; 启动器版本（与 Release tag 对齐）
@@ -87,8 +87,8 @@ global LINK_W := 92
 global gMonitorOn := false        ; /api-monitor（请求监控）当前是否可用
 global gHasGui := false           ; 已建界面？（--inicheck 等无界面模式不碰 / 不弹气泡）
 global gIgnoreIni := false        ; 自检/测试时置 true：ApplyPreset 不读用户 INI
-global gInSetFields := false      ; SetFields 期间抑制 Change 事件（防 mdlD.Text 触发 LoadTemplate 递归）
-global gTplCache := []            ; 模型模板列表缓存
+global gInSetFields := false      ; SetFields 期间抑制 Change 事件
+
 global gMtpList := []           ; MTP 下拉框当前的选项（切模式时换）
 global gUiMode := "simple"        ; 当前界面："simple"（简洁）| "pro"（专业）
 global gParams := {}              ; 最近一次完整的参数集合（简洁模式隐藏字段的取值来源）
@@ -361,8 +361,6 @@ LangFill(e) {
     e["参数"] := "Parameters"
     e["短模式（快）"] := "Short (fast)"
     e["长模式（长上下文）"] := "Long (big context)"
-    e["短 = 20K ctx / k8v4 / MTP 开（专家在 GPU 用 --spec 3；大量化改 cpu 用 --spec 2）/ KV 全常驻 / reserve 64（上限 39936）"] := "short = 20K ctx / k8v4 / MTP on (experts on GPU -> --spec 3; a larger quant: cpu -> --spec 2) / KV fully resident / reserve 64 (ceiling 39936)"
-    e["长 = 80K ctx / KV 全常驻 / reserve 64 / MTP 开（--spec 2，专家在主机内存）/ 上限 81920（实测 65K prompt decode ~19-21 tok/s）"] := "long = 80K ctx / KV fully resident / reserve 64 / MTP on (--spec 2, experts in host RAM) / ceiling 81920 (65K prompt: decode ~19-21 tok/s)"
     e["短：20K 上下文 / MTP 开　长：64K 上下文、KV 全常驻 / MTP 关（实测更快）"] := "short: 20K ctx, MTP on;  long: big ctx, KV fully resident"
     e["上下文长度"] := "Context length"
     e["启用思考"] := "Thinking"
@@ -482,6 +480,8 @@ LangFill(e) {
     e["异常："] := "error: "
     e["运行中"] := "running"
     e["无"] := "none"
+    e["ctx 上下文窗口 · kv K/V 存储（k8v4 最省显存）· mtp 草稿专家放哪（gpu 显存 / cpu 内存）· reserve 留给别人"] := "ctx = window | kv = K/V storage (k8v4 uses the least VRAM) | mtp = where the draft experts live (gpu = VRAM / cpu = RAM) | reserve = kept for other apps"
+    e["能开多大 ctx 由模型的显存占用与 kv 方式决定，不由预设决定；边界检查按本机实测表算"] := "how much ctx fits follows the model's VRAM footprint and the kv mode, not the preset; the bounds line uses the measured table"
     e["无响应"] := "no response"
     e["长"] := "long"
     e["短"] := "short"
@@ -1137,34 +1137,8 @@ DdlText(ctrl, def) {
     return (t = "" ? def : t)
 }
 
-; 扫描 DEV 下的模型模板（strata-qwen36-*.json，排除运行配置）
-ModelTemplates() {
-    global DEV, gTplCache
-    if gTplCache.Length > 0
-        return gTplCache
-    out := []
-    Loop Files, DEV . "\strata-qwen36-*.json"
-    {
-        n := A_LoopFileName
-        if (InStr(n, "-run") || InStr(n, "shared-settings"))
-            continue
-        out.Push(n)
-    }
-    if (out.Length = 0)
-        out.Push("strata-qwen36-iq3s.json")
-    gTplCache := out
-    return out
-}
 
-; 切模板：读该模板的参数套到界面（保留 port/cors/thinking/采样等全局偏好）
-LoadTemplate(name) {
-    return
-}
 
-; 把一个模板 json 解析成参数对象（读 args 里的关键项）
-TemplateToParams(path) {
-    return ""
-}
 
 ; 模板配置里是否已经有“真”的 vision.mmproj（忽略未展开的 %占位符%）
 TemplateHasMmproj() {
@@ -2228,7 +2202,7 @@ ReviewDriverExit() {
 ; ------------------------------------------------- 6. 界面
 CollectFields() {
     global rLong, ctxE, kvD, resE, mtpD, draftD, resvE, portE, corsE, thinkD, presD, hostE, keyE
-    global visD, vistokE, mdlD, nativeE, mmprojE, gInSetFields
+    global visD, vistokE, nativeE, mmprojE, gInSetFields
     global tempE, toppE, topkE, minpE, prespenE, reppenE, dryE, chatTplE, gParams
     o := Normalize(gParams)                  ; 隐藏字段（spec / mtp_cpu_moe / template / native …）从基准集合继承
     o.mode := (rLong.Value ? "long" : "short")
@@ -2253,7 +2227,7 @@ CollectFields() {
     o.temperature := Trim(tempE.Value, " `t`r`n")
     o.top_p := Trim(toppE.Value, " `t`r`n")
     o.top_k := Trim(topkE.Value, " `t`r`n")
-    o.template := DdlText(mdlD, "strata-qwen36-iq3s.json")
+    o.template := "strata-qwen36-iq3s.json"     ; 模板固定：只用一份基础配置
     o.native := Trim(nativeE.Value)
     o.mmproj := Trim(mmprojE.Value)
     o.pack := (o.native = "" ? "" : FindPackFor(o.native))   ; 按当前 GGUF 现查，避免过期/错配
@@ -2271,7 +2245,7 @@ CollectFields() {
 
 SetFields(o) {
     global ctxE, kvD, resE, mtpD, draftD, resvE, portE, corsE, thinkD, presD, hostE, keyE, rShort, rLong
-    global visD, vistokE, mdlD, nativeE, mmprojE, gInSetFields
+    global visD, vistokE, nativeE, mmprojE, gInSetFields
     global tempE, toppE, topkE, minpE, prespenE, reppenE, dryE
     o := Normalize(o)
     ctxE.Value := String(o.ctx)
@@ -2291,7 +2265,7 @@ SetFields(o) {
     corsE.Value := o.cors
     thinkD.Text := InList(o.thinking, YN_LIST, "on")
     gInSetFields := true
-    mdlD.Text := InList(Prop(o, "template", "strata-qwen36-iq3s.json"), ModelTemplates(), "strata-qwen36-iq3s.json")
+    ; 模板下拉已移除（只有一份基础配置）
     nativeE.Value := Prop(o, "native", "")
     mmprojE.Value := Prop(o, "mmproj", "")
     visD.Text := InList(Prop(o, "vision", "cpu"), VISION_LIST, "cpu")
@@ -2548,24 +2522,23 @@ BuildGui() {
     rShort := g.AddRadio("x22 y32 w110", "短模式（快）")
     rLong := g.AddRadio("x150 y32 w160", "长模式（长上下文）")
     rShort.Value := 1
-    g.AddText("x22 y56 w676 c404040", "短 = 20K ctx / k8v4 / MTP 开（专家在 GPU 用 --spec 3；大量化改 cpu 用 --spec 2）/ KV 全常驻 / reserve 64（上限 39936）")
-    g.AddText("x22 y74 w676 c404040", "长 = 80K ctx / KV 全常驻 / reserve 64 / MTP 开（--spec 2，专家在主机内存）/ 上限 81920（实测 65K prompt decode ~19-21 tok/s）")
     bndT := g.AddText("x22 y94 w676 c006400", "边界检查: —")
     rShort.OnEvent("Click", (*) => ApplyPreset("short"))
     rLong.OnEvent("Click", (*) => ApplyPreset("long"))
+    g.AddText("x22 y56 w676 c404040", "ctx 上下文窗口 · kv K/V 存储（k8v4 最省显存）· mtp 草稿专家放哪（gpu 显存 / cpu 内存）· reserve 留给别人")
+    g.AddText("x22 y74 w676 c404040", "能开多大 ctx 由模型的显存占用与 kv 方式决定，不由预设决定；边界检查按本机实测表算")
 
     g.AddGroupBox("x8 y118 w704 h206", "参数（改完直接点启动；字段名与驱动一致）")
-    ; 模型行：模板下拉 + GGUF / mmproj 文件选择
-    g.AddText("x22 y142 w40", "模型")
-    mdlD := g.AddDropDownList("x64 y138 w200", ModelTemplates())
-    mdlD.OnEvent("Change", (*) => LoadTemplate(mdlD.Text))
-    g.AddButton("x270 y138 w58 h26", "GGUF…").OnEvent("Click", (*) => PickNative())
-    g.AddButton("x332 y138 w62 h26", "mmproj…").OnEvent("Click", (*) => PickMmproj())
-    g.AddButton("x398 y138 w44 h26", "清空").OnEvent("Click", (*) => (nativeE.Value := "", mmprojE.Value := "", UpdateVisionEnabled(), Tip("已清空 GGUF/mmproj 覆盖")))
-    nativeE := g.AddEdit("x446 y138 w256 h24 ReadOnly", "")
+      ; 模型两行（与简洁模式同形状）：标签 + 只读路径 + 选择…
+    g.AddText("x22 y142 w44", "GGUF")
+    nativeE := g.AddEdit("x70 y138 w396 h24 ReadOnly", "")
     nativeE.SetFont("s8")
-    mmprojE := g.AddEdit("x22 y164 w680 h20 ReadOnly", "")
+    g.AddButton("x474 y136 w70 h26", "选择…").OnEvent("Click", (*) => PickNative())
+    g.AddButton("x550 y136 w60 h26", "清空").OnEvent("Click", (*) => (nativeE.Value := "", mmprojE.Value := "", UpdateVisionEnabled(), Tip("已清空 GGUF/mmproj 覆盖")))
+    g.AddText("x22 y168 w50", "mmproj")
+    mmprojE := g.AddEdit("x76 y164 w390 h24 ReadOnly", "")
     mmprojE.SetFont("s8")
+    g.AddButton("x474 y162 w70 h26", "选择…").OnEvent("Click", (*) => PickMmproj())
     ; 4 列网格：标签宽 76 / 输入宽 76 / 列距 160（列起点 x22 / x182 / x342 / x502）
     g.AddText("x22 y200 w76", "ctx")
     ctxE := g.AddEdit("x98 y196 w76", "20480")
