@@ -41,7 +41,7 @@ TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动
 |---|---|---|
 | `--max-context` | 20480 | **81920** |
 | KV | `k8v4`，全驻留 | `k8v4`，全驻留 |
-| MTP | 开，专家**在 GPU**（`--spec 3`） | 开，专家**在 CPU**（`--mtp-cpu-moe 1`，`--spec 2`） |
+| MTP | 开，专家**在 GPU**（`--spec 3`）*或* **在 CPU**（`--mtp-cpu-moe 1`，`--spec 2`）/ 关 | 开，专家**在 CPU**（`--mtp-cpu-moe 1`，`--spec 2`） |
 | `--vram-reserve-mib` | 64 | 64 |
 | `--expert-cache` | 800 | 800 |
 | 能启动的最大上下文 | 39936 | **81920** |
@@ -385,6 +385,9 @@ Niko1221 及贡献者）。`LICENSE` 是上游原样，派生关系与免责声�
   [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) 的三步判据验一遍：
   `qwen35moe` + `block_count 41` + 文件名带 MTP / `strata_inspect.py` 结尾打印
   `with an MTP layer`。
+- **4 GB 卡上的参数**：`UD-IQ3_S` 用短模式即可（MTP 专家在显存）；**`UD-IQ4_XS` 这类更大的量化要把 MTP 专家放到 CPU**
+  （界面上「mtp」选 `cpu`，或 `--spec 2 --mtp-cpu-moe 1`），否则 prefill 的缓冲抢不到显存（症状：`prefill ... out of memory`）。
+  实测：IQ4_XS + `--mtp-cpu-moe` + ctx 20480 → 21 秒就绪，视觉也能起；同参数用 `--spec 3` 会失败。
 - **配套 pack**：`UD-IQ3_S` 用 Release 里的 `pack-qwen36-UD-IQ3_S.zip`（43.7 MB）；
   其他量化用 `tools/make_pack.py` 现做（3 秒 / 65 MB）—— 详见 §4.3。
 - 模型许可：Unsloth 的这份 GGUF 是 Apache-2.0；模型权重不在本仓库内。

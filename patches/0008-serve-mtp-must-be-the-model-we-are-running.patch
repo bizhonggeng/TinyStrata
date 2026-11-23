@@ -1,0 +1,101 @@
+From b7de3e52b4aba87903983f2134712c220e1beed6 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 21:46:14 +0800
+Subject: [PATCH 8/8] serve: --mtp must be the model we are running
+
+Reported from a real user test: the launcher pointed --native at a new GGUF (UD-IQ4_XS) and the
+server correctly rebuilt the pack, but --mtp still named the old UD-IQ3_S file -- a draft layer
+belongs to one file, so the engine died while loading it.
+
+ensure_mtp(): if --mtp's basename differs from --native, read the model's
+<arch>.nextn_predict_layers; > 0 -> --mtp becomes this model; 0 -> drop --mtp and
+--mtp-draft-vocab (another model's head must not be loaded). Called after ensure_paths, before
+ensure_pack.
+
+Also (same test): UD-IQ4_XS on a 4 GB card has no VRAM left for prefill scratch with the short
+mode's --spec 3; --spec 2 --mtp-cpu-moe 1 --ctx 20480 is ready in 21 s with vision on. The
+launcher now offers cpu in short mode and derives --spec from the MTP placement (2/3), and its
+preflight warns about a >16 GB quant with the experts in VRAM.
+---
+ serve/prepare.py | 55 ++++++++++++++++++++++++++++++++++++++++++++++++
+ serve/server.py  |  1 +
+ 2 files changed, 56 insertions(+)
+
+diff --git a/serve/prepare.py b/serve/prepare.py
+index 7bfa75ac..1ac5d6de 100644
+--- a/serve/prepare.py
++++ b/serve/prepare.py
+@@ -136,6 +136,61 @@ def ensure_paths(cfg: dict, log=print) -> bool:
+     return changed
+ 
+ 
++def nextn_layers(gguf: pathlib.Path) -> int | None:
++    """How many MTP (nextn) layers the file carries, or None when it cannot be read."""
++    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
++    if tools.is_dir() and str(tools) not in sys.path:
++        sys.path.insert(0, str(tools))                     # gguf_reader lives with the engine
++    try:
++        import gguf_reader as G
++    except Exception:
++        return None
++    try:
++        g = G.GGUFFile(gguf)
++        arch = g.metadata.get("general.architecture")
++        if not arch:
++            return None
++        v = g.metadata.get(arch + ".nextn_predict_layers")
++        return int(v) if v is not None else 0
++    except Exception:
++        return None
++
++
++def ensure_mtp(cfg: dict, log=print) -> bool:
++    """`--mtp` must be the model we are actually running.
++
++    A draft layer belongs to one file: the MTP block of *this* quant.  Pointing --mtp at a
++    different quant of the same family (the template's default) loads another model's draft
++    head, and the engine dies while loading it.  So: follow --native when the file has an MTP
++    layer, drop the draft arguments when it has none.
++    """
++    args = list(cfg.get("args") or [])
++    native = _arg(args, "--native")
++    if not native or "--mtp" not in args:
++        return False
++    gguf = pathlib.Path(native)
++    if not gguf.is_file():
++        return False
++    cur = os.path.expandvars(_arg(args, "--mtp"))
++    if cur and pathlib.Path(cur).name.lower() == gguf.name.lower():
++        return False                                     # already this model
++    nextn = nextn_layers(gguf)
++    if nextn is None:
++        return False                                     # unreadable metadata: leave it alone
++    if nextn > 0:
++        args[args.index("--mtp") + 1] = str(gguf)
++        cfg["args"] = args
++        log(f"[prepare] --mtp -> this model's own MTP layer ({gguf.name})")
++        return True
++    for flag in ("--mtp", "--mtp-draft-vocab"):
++        while flag in args:
++            i = args.index(flag)
++            del args[i:i + 2]
++    cfg["args"] = args
++    log("[prepare] this model has no MTP layer: dropped --mtp / --mtp-draft-vocab")
++    return True
++
++
+ def ensure_vision(cfg: dict, log=print) -> bool:
+     """Drop the vision encoder when its files are placeholders or missing.
+ 
+diff --git a/serve/server.py b/serve/server.py
+index e1b0ff70..52718b3f 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6359,6 +6359,7 @@ def main() -> int:
+             from serve import prepare as prepare_mod
+             # paths first: ensure_pack prefers `strata.exe pack`, which needs a resolved exe
+             prepare_mod.ensure_paths(cfg, log=lambda m: print(m, flush=True))
++            prepare_mod.ensure_mtp(cfg, log=lambda m: print(m, flush=True))
+             pack_changed = prepare_mod.ensure_pack(cfg, log=lambda m: print(m, flush=True))
+         except Exception as e:                      # never let model preparation kill the server
+             print(f"[strata] pack preparation failed: {e}", flush=True)

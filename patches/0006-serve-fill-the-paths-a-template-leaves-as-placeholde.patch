@@ -1,7 +1,7 @@
 From 90a0167f96fe60fb702592d5d70e1b9f4e6212ad Mon Sep 17 00:00:00 2001
 From: strata-4gb <strata-4gb@localhost>
 Date: Mon, 23 Nov 2026 16:16:41 +0800
-Subject: [PATCH 6/7] serve: fill the paths a template leaves as %placeholders%
+Subject: [PATCH 6/8] serve: fill the paths a template leaves as %placeholders%
 
 The portable bundle ships a template with %STRATA_ROOT%/%STRATA_PACKS% style placeholders
 because it cannot know where the user puts the GGUF or the packs.  prepare.py now closes

@@ -46,7 +46,7 @@ RTX 3050 Ti Laptop **4 GB** + i5-11400H + 32 GB, two parameter sets:
 |---|---|---|
 | `--max-context` | 20480 | **81920** |
 | KV | `k8v4`, fully resident | `k8v4`, fully resident |
-| MTP | on, experts **on the GPU** (`--spec 3`) | on, experts **on the CPU** (`--mtp-cpu-moe 1`, `--spec 2`) |
+| MTP | on, experts **on the GPU** (`--spec 3`) *or* **on the CPU** (`--mtp-cpu-moe 1`, `--spec 2`) / off | on, experts **on the CPU** (`--mtp-cpu-moe 1`, `--spec 2`) |
 | `--vram-reserve-mib` | 64 | 64 |
 | `--expert-cache` | 800 | 800 |
 | largest context that starts | 39936 | **81920** |
@@ -399,6 +399,10 @@ The patches are authored as `strata-4gb <strata-4gb@localhost>`; after applying,
   uploader, run the three-step check in
   [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md): `qwen35moe` +
   `block_count 41` + an MTP-named file / `strata_inspect.py` printing `with an MTP layer`.
+- **Parameters on a 4 GB card**: `UD-IQ3_S` runs in short mode (MTP experts in VRAM); **a larger quant such as
+  `UD-IQ4_XS` needs the MTP experts on the CPU** (pick `cpu` in the launcher's mtp field, or
+  `--spec 2 --mtp-cpu-moe 1`), otherwise prefill cannot get its scratch buffers (`prefill ... out of memory`). Measured: IQ4_XS + `--mtp-cpu-moe` + ctx 20480 is ready in 21 s
+  with vision on; the same with `--spec 3` fails.
 - **Matching pack**: `UD-IQ3_S` uses `pack-qwen36-UD-IQ3_S.zip` from Releases (43.7 MB);
   any other quant: `tools/make_pack.py` builds one in 3 s / 65 MB -- see §4.3.
 - Model licence: this Unsloth GGUF is Apache-2.0. Weights are not part of this repository.

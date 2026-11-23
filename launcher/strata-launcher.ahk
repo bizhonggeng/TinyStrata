@@ -96,6 +96,7 @@ global gPro := 0                  ; 专业模式窗口
 global gSimple := 0               ; 简洁模式窗口
 global gAbout := 0                ; 「关于」窗口
 global gPack := ""                ; 本次实际用的 pack 目录（"" = 沿用模板里的 --pack）
+global gRebuilding := false      ; 正在销毁/重建窗口：定时器与按钮必须停手（否则读到已销毁的控件）
 global gLastBasePort := -1        ; 简洁模式里 base_url / 网页聊天链接上次用的端口
 global SIMPLE_W := 460            ; 简洁模式窗口尺寸 + 浏览器那一行的位置（自检会检查它离底部有留白）
 global SIMPLE_H := 552            ; 486 + 66：多了「模型」分组（GGUF / mmproj 两行）
@@ -108,7 +109,7 @@ global S_BASE_H := 26
 global KV_LIST := ["k8v4", "q4_0", "int8", "fp16"]
 ; MTP 选项按模式：短模式 = gpu（专家在显存）/ off；长模式 = cpu（专家在主机内存，省 312 MiB）/ off
 global TPL_DIR := ""   ; chat 模板默认目录（Locate() 里按 HOME\templates 定）
-global MTP_LIST_SHORT := ["gpu", "off"]
+global MTP_LIST_SHORT := ["gpu", "cpu", "off"]   ; gpu = 专家在显存（IQ3_S 最快）；cpu = 上 CPU（大量化必须）
 global MTP_LIST_LONG := ["cpu", "off"]   ; 长模式只有 cpu/off：专家全上 GPU 会装不下（80K 上下文放不下 312 MiB）
 ; ---------------------------------------------------------------- 0. 便携化定位
 ; 找到 strata.exe 在哪，然后把 DEV/ROOT/PY/DRIVER/... 全部派生出来。
@@ -360,7 +361,7 @@ LangFill(e) {
     e["参数"] := "Parameters"
     e["短模式（快）"] := "Short (fast)"
     e["长模式（长上下文）"] := "Long (big context)"
-    e["短 = 20K ctx / k8v4 / MTP 开（--spec 3，专家在 GPU）/ KV 全常驻 / reserve 64（上限 39936）"] := "short = 20K ctx / k8v4 / MTP on (--spec 3, experts on GPU) / KV fully resident / reserve 64 (ceiling 39936)"
+    e["短 = 20K ctx / k8v4 / MTP 开（专家在 GPU 用 --spec 3；大量化改 cpu 用 --spec 2）/ KV 全常驻 / reserve 64（上限 39936）"] := "short = 20K ctx / k8v4 / MTP on (experts on GPU -> --spec 3; a larger quant: cpu -> --spec 2) / KV fully resident / reserve 64 (ceiling 39936)"
     e["长 = 80K ctx / KV 全常驻 / reserve 64 / MTP 开（--spec 2，专家在主机内存）/ 上限 81920（实测 65K prompt decode ~19-21 tok/s）"] := "long = 80K ctx / KV fully resident / reserve 64 / MTP on (--spec 2, experts in host RAM) / ceiling 81920 (65K prompt: decode ~19-21 tok/s)"
     e["短：20K 上下文 / MTP 开　长：64K 上下文、KV 全常驻 / MTP 关（实测更快）"] := "short: 20K ctx, MTP on;  long: big ctx, KV fully resident"
     e["上下文长度"] := "Context length"
@@ -516,7 +517,7 @@ LangFill(e) {
     e[" / resident "] := " / resident "
     e[" 这个组合本机未实测（短模式 k8v4+MTP 到 39936、长模式 k8v4 全常驻到 81920）"] := " is not measured on this machine (short k8v4+MTP up to 39936, long k8v4 resident up to 81920)"
     e[" · 实测边界（"] := " · measured bounds ("
-    e["）"] := ")"
+    e["）"] := ") "
     e[" 能启动 / "] := " starts / "
     e[" 被拒  ->  当前 ctx "] := " refused  ->  current ctx "
     e["可启动"] := "ok"
@@ -524,6 +525,54 @@ LangFill(e) {
     e["），改完点「启动」"] := "), edit then press Start"
     e["关于 / About"] := "About"
     e["语言 / Language"] := "Language"
+    e["引擎缺失: "] := "engine missing: "
+    e["（把 strata.exe 放到启动器旁边，或设 STRATA_HOME）"] := " (put strata.exe next to the launcher, or set STRATA_HOME)"
+    e["服务层缺失: "] := "server layer missing: "
+    e["（引擎本身没有 HTTP 服务，serve\ 目录必须存在）"] := " (the engine has no HTTP server of its own; the serve\ directory must exist)"
+    e["python 缺失: "] := "python missing: "
+    e["（检出布局需先在 "] := " (a checkout needs "
+    e["跑一次 START-HERE.bat；便携包需带 python\python.exe）"] := " to run START-HERE.bat once; a portable bundle needs python\python.exe)"
+    e["驱动缺失: "] := "driver missing: "
+    e["模板配置缺失: "] := "config template missing: "
+    e["参数错误: "] := "bad argument: "
+    e["预检未通过："] := "preflight failed:"
+    e["运行环境: "] := "environment: "
+    e["没有指定 GGUF 模型文件：用「选择…」（简洁模式也有）选一次，或把配置模板里的 --native / 环境变量设好"] := "no GGUF model file: pick one with the Browse button (the simple view has it too), or set --native in the template / the environment"
+    e["已经有实例在跑（引擎 pid "] := "an instance is already running (engine pid "
+    e[" / 服务端 pid "] := " / server pid "
+    e["）：驱动启动时会先把它杀掉 —— 单卡上这是设计行为。"] := "): the driver kills it first, which is by design on a single card."
+    e["内存护栏已在运行（pid "] := "the RAM guard is already running (pid "
+    e["），驱动会复用它。"] := "); the driver reuses it."
+    e["空闲内存 "] := "RAM free "
+    e[" MB（共 "] := " MB of "
+    e[" MB），引擎要吞约 12 GiB 专家进内存；"] := " MB); the engine needs ~12 GiB of experts in RAM;"
+    e["护栏在余量 <"] := "the guard kills below "
+    e[" MB 时会杀引擎。"] := " MB free."
+    e["内存余量只有 "] := "only "
+    e[" MB，低于护栏阈值 "] := " MB free, below the guard threshold of "
+    e[" MB —— 驱动一起来就会把引擎杀掉。先关掉占内存的程序再启动。"] := " MB -- the driver kills the engine right away; close the memory hogs first."
+    e["显存实际被占用"] := "VRAM actually in use (threshold "
+    e["ctx 超过本机全常驻实测上限 81920（含 reserve 64）：显存要放下全部 K/V，很可能被拒。"] := "ctx is past this machine's measured 81920 ceiling (reserve 64): all K/V has to fit in VRAM, so it will likely be refused."
+    e["）；引擎很可能拒绝启动并告诉你差多少 MiB。"] := "); the engine will likely refuse and say how many MiB short."
+    e["ctx 必须是正整数"] := "ctx must be a positive integer"
+    e["kv-resident 只能是 0（关闭流式）或 >= 20480（引擎下限）"] := "kv-resident is either 0 (no streaming) or >= 20480 (the engine's floor)"
+    e["port 必须在 1-65535"] := "port must be 1-65535"
+    e["vram-reserve-mib 不能为负"] := "vram-reserve-mib cannot be negative"
+    e["超过本机实测硬上限 "] := "is past this machine's measured ceiling "
+    e["，实测 "] := "; measured "
+    e[" 被拒）。降到 "] := " refused). Lower it to "
+    e["或以下。"] := "or below."
+    e["启动前提醒："] := "before starting:"
+    e["预览前提醒（不影响 --check）："] := "before previewing (--check ignores these):"
+    e["（后台运行，不弹窗口；输出写 "] := " (runs in the background, no window; output goes to "
+    e["（无窗口）：引擎加载约 12 秒，状态变绿即就绪；驱动输出见「驱动输出」按钮"] := " (no window): the engine takes ~12 s to load; once the badge is green it is ready. See the Driver output button for its log"
+    e["已等多久"] := "elapsed"
+    e["进程还在但引擎没在跑（上次的残留？点「停止」清掉）"] := "the process is alive but the engine is not (leftover from a previous run? press Stop)"
+    e["（"] := " ("
+    e["："] := ": "
+    e["，"] := ", "
+    e["。"] := "."
+    e["；"] := "; "
     return e
 }
 
@@ -750,39 +799,48 @@ ShowAbout() {
     gAbout.Show("AutoSize Center")
 }
 
-; 切换语言：存 INI，然后两个窗口一起重建
+
 ; 切换语言：存 INI，然后两个窗口一起重建（参数集合从界面上收集，不丢设置）
-SetLang(v) {
-    global gLang
+SetLang(v, show := true) {
+    global gLang, gIgnoreIni
     new := (v = "") ? DetectLang() : v
     if (new = gLang)
         return
     gLang := new
-    SaveLang(new)
-    RebuildUi()
+    if !gIgnoreIni
+        SaveLang(new)          ; 自检时别改用户的 ini
+    RebuildUi(show)
 }
 
-RebuildUi() {
-    global gPro, gSimple, gUiMode
-    cur := CollectCurrent()
-    mode := gUiMode
-    try gPro.Destroy()
-    try gSimple.Destroy()
-    gPro := BuildGui()
-    gSimple := BuildSimpleGui()
-    gUiMode := mode
-    SetCurrent(cur)
-    UpdateDerived()
-    if (gUiMode = "simple")
-        gSimple.Show("w" . SIMPLE_W . " h" . SIMPLE_H)
-    else
-        gPro.Show("w" . PRO_W . " h" . PRO_H)
-    RefreshStatus()
+RebuildUi(show := true) {
+    global gPro, gSimple, gUiMode, gRebuilding
+    gRebuilding := true                        ; 定时器/按钮在这期间一律不动窗口
+    mode := gUiMode, cur := ""
+    try {
+        cur := CollectCurrent()                ; 先把值收集下来（此时控件还活着）
+        mode := gUiMode
+        try gPro.Destroy()
+        try gSimple.Destroy()
+        gPro := BuildGui()
+        gSimple := BuildSimpleGui()
+        gUiMode := mode
+        SetCurrent(cur)
+        UpdateDerived()
+    } finally {
+        gRebuilding := false
+    }
+    if show {
+        if (gUiMode = "simple")
+            gSimple.Show("w" . SIMPLE_W . " h" . SIMPLE_H)
+        else
+            gPro.Show("w" . PRO_W . " h" . PRO_H)
+    }
+    RefreshStatus()                            ; 放闸门之后再刷新（它会读控件）
 }
 
 ; 语言自检：EN 模式下遍历两个窗口的所有控件，断言不含中文；再切回 zh 断言还原
 I18ntest() {
-    global gLang, gPro, gSimple, gUiMode, I18NLOG
+    global gLang, gPro, gSimple, gUiMode, I18NLOG, BASE_CFG
 
     gLang := "en"
     gPro := BuildGui()
@@ -820,6 +878,58 @@ I18ntest() {
     ; 英文串不被二次破坏
     FT(rep, "英文串不被改写", Tf("Already English") = "Already English", Tf("Already English"))
 
+    ; 动态文案（弹窗 / 状态行 / 确认框）：这些是"拼出来的"，控件检查覆盖不到
+    dyn := []
+    pfBad := PreflightNoDlg({mode: "short", ctx: 999999, kv: "k8v4", resident: 0, mtp: "on", draft: "en",
+                             reserve: 256, port: 1339, cors: "*", thinking: "on", preserve: "on"})
+    dyn.Push(["preflight", pfBad.msg])
+    dyn.Push(["boundary", BoundaryText({mode: "long", ctx: 81920, kv: "k8v4", resident: 0, mtp: "on", mtp_cpu_moe: "on"})])
+    dyn.Push(["state-loading", StateLine({state: "loading", port: 1339, nCtx: 0, mode: "short", sleeping: "",
+        alias: "", http: {ok: true, status: 503}, ram: {free: 100, total: 100},
+        procs: {engine: [], serve: [], driver: [], guard: [], launcher: 0}}).text])
+    dyn.Push(["state-zombie", StateLine({state: "zombie", port: 1339, nCtx: 0, mode: "", sleeping: "",
+        alias: "", http: {ok: true, status: 503}, ram: {free: 100, total: 100},
+        procs: {engine: [], serve: [], driver: [], guard: [], launcher: 0}}).text])
+    dyn.Push(["stop-confirm", StopConfirmText()])
+    dyn.Push(["badge-loading", StateBadge({state: "loading"}).word])
+    leftoverDyn := []
+    for it in dyn {
+        t := Tf(it[2])
+        if RegExMatch(t, "[\x{4e00}-\x{9fff}]")
+            leftoverDyn.Push(it[1] . " -> " . t)
+    }
+    FT(rep, "动态文案（预检/边界/状态/确认框/状态图）EN 后无中文", leftoverDyn.Length = 0,
+        Join(leftoverDyn, " | "))
+    rep.Push("")                                    ; 下面是实际渲染出来的英文，人工过一眼
+    for it in dyn
+        rep.Push("  [" . it[1] . "] " . StrReplace(Tf(it[2]), "`n", " / "))
+
+    ; PackProblem / EnvProblems：整句双语的动态文案（曾经靠片段替换，英文变夹生饭）
+    savedCfg3 := BASE_CFG
+    tmpCfg3 := A_Temp . "\strata-i18n-pack.json"
+    try FileDelete(tmpCfg3)
+    FileAppend('{"args": []}', tmpCfg3, 'UTF-8')          ; 模板里没有 --pack
+    BASE_CFG := tmpCfg3
+    pkNone := PackProblem({native: "Some-Model-UD-Q9_K.gguf"})
+    BASE_CFG := savedCfg3
+    pkBad := PackProblem({native: "Some-Model-UD-Q9_K.gguf"})   ; 模板的 pack 指向别的模型
+    try FileDelete(tmpCfg3)
+    envFake := EnvProblems("7.5")                          ; 造一张 sm_75 的卡，走到"自己编译"那条
+    texts3 := [["pack-no-pack", pkNone], ["pack-mismatch", pkBad]]
+    for m in envFake.hard
+        texts3.Push(["env-hard", m])
+    for m in envFake.soft
+        texts3.Push(["env-soft", m])
+    bad3 := []
+    for it in texts3 {
+        if RegExMatch(it[2], "[\x{4e00}-\x{9fff}]")
+            bad3.Push(it[1] . " -> " . it[2])
+    }
+    FT(rep, "PackProblem / EnvProblems 的 EN 文案无中文", bad3.Length = 0, Join(bad3, " | "))
+    rep.Push("")
+    for it in texts3
+        rep.Push("  [" . it[1] . "] " . it[2])
+
     ; 切回中文：控件应重新出现中文
     gLang := "zh"
     try gPro.Destroy()
@@ -839,8 +949,12 @@ I18ntest() {
     try gSimple.Destroy()
 
     ok := 0, fail := 0
-    for line in rep
-        (SubStr(line, 1, 6) = "[ OK ]") ? ok++ : fail++
+    for line in rep {
+        if (SubStr(line, 1, 6) = "[ OK ]")
+            ok++
+        else if (SubStr(line, 1, 6) = "[FAIL]")
+            fail++
+    }
     if FileExist(I18NLOG)
         FileDelete(I18NLOG)
     for line in rep
@@ -938,6 +1052,15 @@ RefreshMtpList(ddl, mode) {
     for v in want
         ddl.Add([v])            ; Add 要数组
     gMtpList := want.Clone()
+}
+
+; --spec 与 MTP 专家位置是配套量出来的：gpu=3（IQ3_S 短模式 24.7 tok/s），cpu=2（长模式/IQ4_XS）
+SpecForMtp(mtpMode, mode) {
+    if (mtpMode = "cpu")
+        return "2"
+    if (mtpMode = "gpu")
+        return "3"
+    return (mode = "long" ? "2" : "3")       ; off 时 spec 只要 >= 2（native pack 的硬要求）
 }
 
 MtpModeToParams(mode) {
@@ -1151,18 +1274,23 @@ EffectivePack() {                         ; 本次实际会用的 pack
     return (gPack != "") ? gPack : TemplatePack()
 }
 
-PackProblem(o) {                           ; "" = 没问题；否则是要拦下来的原因（o 由调用方传，避免依赖界面控件）
+PackProblem(o) {                           ; "" = 没问题；否则是要提醒的原因（整句双语，不走片段替换）
+    global gLang
+    en := (gLang = "en")
     native := Prop(o, "native", "")
     if (native = "")
         return ""                         ; 完全没指定 GGUF 由另一条提醒负责
     pack := EffectivePack()
     if (pack = "")
-        return "这个 GGUF 还没有 pack：启动时由服务端自动生成（约 3 秒 / 65 MB）"
+        return en ? ("no pack yet for " . BaseName(native) . ": the server builds one at start (~3 s / 65 MB)")
+                  : ("这个 GGUF 还没有 pack：启动时由服务端自动生成（约 3 秒 / 65 MB）")
     if !DirExist(pack)
-        return "pack 目录不存在: " . pack
+        return en ? ("pack directory missing: " . pack) : ("pack 目录不存在: " . pack)
     named := PackHeaderGguf(pack)
     if (named != "" && StrLower(named) != StrLower(BaseName(native)))
-        return "pack 与模型不匹配（pack 指向「" . named . "」）：启动时服务端会自动重建（约 3 秒）"
+        return en ? ("the pack does not match this model (the pack points at " . named
+                     . "): the server rebuilds it at start (~3 s)")
+                  : ("pack 与模型不匹配（pack 指向「" . named . "」）：启动时服务端会自动重建（约 3 秒）")
     return ""
 }
 
@@ -1213,19 +1341,24 @@ GpuComputeCap() {
 }
 
 ; 环境问题列表：缺 DLL 是硬伤（引擎起不来），架构不是 86 只是警告（可以自己重编）。
-EnvProblems() {
+EnvProblems(capOverride := "") {
+    global gLang
+    en := (gLang = "en")
     env := {hard: [], soft: []}
     d := CudaDlls()
     if (d.cudart = "")
-        env.hard.Push("缺 cudart64_12.dll：装 CUDA Toolkit 12.x，或把配置里的 lib_dirs 指到它的 bin")
+        env.hard.Push(en ? "cudart64_12.dll not found: install CUDA Toolkit 12.x, or point the config lib_dirs at its bin"
+                         : "缺 cudart64_12.dll：装 CUDA Toolkit 12.x，或把配置里的 lib_dirs 指到它的 bin")
     if (d.cublas = "")
-        env.hard.Push("缺 cublas64_12.dll：同上")
-    cap := GpuComputeCap()
+        env.hard.Push(en ? "cublas64_12.dll not found: same fix as cudart64_12.dll"
+                         : "缺 cublas64_12.dll：同上")
+    cap := (capOverride != "") ? capOverride : GpuComputeCap()
     if (cap != "" && cap != "8.6") {
-        ; 用中文引号：AHK 字符串里不能直接写英文双引号（要反引号转义，容易出错）
-        env.soft.Push("本 Release 的引擎是 sm_86 编的，这块卡是 compute " . cap
-            . "；可能报「no kernel image」。要在这块卡上跑，请按 README 「自己编译」一节编一份"
-            . "（-DCMAKE_CUDA_ARCHITECTURES=" . StrReplace(cap, ".", "") . "），然后把启动器的引擎路径指向它")
+        env.soft.Push(en
+            ? ("this release is built for sm_86; this card is compute " . cap . ", so it may report no kernel image -- "
+               . "build your own with " . ArchFlagFor(cap) . " (README: building it yourself)")
+            : ("本 Release 的引擎是 sm_86 编的，这块卡是 compute " . cap . "；可能报「no kernel image」。要在这块卡上跑，"
+               . "请按 README「自己编译」一节编一份（" . ArchFlagFor(cap) . "），然后把启动器的引擎路径指向它"))
     }
     return env
 }
@@ -1752,19 +1885,22 @@ DecideState(anyProc, httpOk, httpStatus, driverAlive, logAgeMin) {
     if (httpOk && httpStatus = 200)
         return "running"
     if httpOk
-        return "loading"                       ; 端口通了但引擎没就绪（/props 503）
+        ; 端口通了但引擎没就绪（/props 503 "the engine is not running"）：真正加载的那几分钟
+        ; 也是这个回应，所以同样要证据 —— 驱动还活着，或日志刚刚还在写。都没有就是上次的残留。
+        if (driverAlive || (logAgeMin >= 0 && logAgeMin <= LOG_FRESH_MIN))
+            return "loading"
     if (driverAlive || (logAgeMin >= 0 && logAgeMin <= LOG_FRESH_MIN))
         return "loading"                       ; 端口没通，但看得出来正在加载
     return "zombie"                            ; 进程在、也不在加载 → 残留或崩了
 }
 
 ; 我们这次启动的驱动（cmd 包装进程 / python 驱动）还活着吗
+; "DID WE start a load?" -- only our own driver counts.  A stranger's driver (a run from an
+; earlier session, still lying around) is a process, not evidence that something is loading:
+; treating it as evidence is why a stale server on the port read as "加载中" forever.
 DriverAlive() {
     global gDriverPid
-    if (gDriverPid && ProcessExist(gDriverPid))
-        return true
-    st := FindProcs()
-    return (st.driver.Length || st.launcher.Length) ? true : false
+    return (gDriverPid && ProcessExist(gDriverPid)) ? true : false
 }
 
 ; 服务端/引擎日志里最新的一次写入是几分钟前（都没有则 -1）
@@ -1802,7 +1938,7 @@ StateLine(st) {
         return {text: Tf("运行状态: ") . "◐ " . Tf("加载中…") . "（" . Tf("引擎在起，端口 ") . st.port . Tf(" 还没就绪")
             . (ElapsedText() != "" ? " · " . ElapsedText() : "") . "）", color: "B8860B"}
     if (st.state = "zombie")
-        return {text: Tf("运行状态: ") . "✕ " . Tf("异常") . "：" . Tf("进程还在但端口 ") . st.port . Tf(" 无响应，日志也停了"), color: "C00000"}
+        return {text: Tf("运行状态: ") . "✕ " . Tf("异常") . "：" . Tf("进程还在但引擎没在跑（上次的残留？点「停止」清掉）"), color: "C00000"}
     return {text: Tf("运行状态: ") . "○ " . Tf("未运行") . "（" . Tf("端口 ") . st.port . Tf(" 无响应）"), color: "606060"}
 }
 
@@ -1826,6 +1962,16 @@ Preflight(o, addCheck) {
     pp := PackProblem(o)
     if (pp != "")
         warns.Push(pp)            ; 不是拦下来：服务端会自己准备好
+    ; 大量化 + MTP 专家在显存：4 GB 卡上会挤掉预填缓冲（实测 IQ4_XS 18 GB 用 --spec 3 会 "out of memory"）
+    nv := Prop(o, "native", "")
+    if (nv != "" && Prop(o, "mtp_cpu_moe", "off") != "on") {
+        sz := 0
+        try sz := FileGetSize(nv)
+        if (sz > 16 * 1024 ** 3)
+            warns.Push("这个量化 " . Round(sz / 1024 ** 3, 1) . " GB：短模式的 MTP 专家放在显存里，"
+                     . "4 GB 卡上很可能没显存给预填缓冲（症状：prefill ... out of memory）。"
+                     . "改用长模式那套（mtp=cpu / --mtp-cpu-moe 1 --spec 2）")
+    }
     env := EnvProblems()
     for m in env.hard
         problems.Push("运行环境: " . m)
@@ -1900,7 +2046,7 @@ DoLaunch(addCheck) {
     }
     if (pf.warns.Length) {
         head := addCheck ? "预览前提醒（不影响 --check）：" : "启动前提醒："
-        if (MsgBox(Tf(head) . "`n`n  - " . Join(pf.warns, "`n  - ") . Tf("`n`n继续？"),
+        if (MsgBox(Tf(head) . "`n`n  - " . Tf(Join(pf.warns, "`n  - ")) . Tf("`n`n继续？"),
                    "TinyStrata 启动器", "Icon! 0x4") != "Yes") {
             SetStatusText("用户取消了启动（提醒未通过）", "C00000")
             return
@@ -2077,6 +2223,7 @@ CollectFields() {
         o.mtp_mode := "cpu"          ; 长模式没有 gpu（装不下）
     o.mtp := (o.mtp_mode = "off") ? "off" : "on"
     o.mtp_cpu_moe := (o.mtp_mode = "cpu") ? "on" : "off"
+    o.spec := SpecForMtp(o.mtp_mode, o.mode)   ; 专家位置变了，投机宽度换成实测配套值
     o.draft := DdlText(draftD, "en")
     o.reserve := IntOr(resvE.Value, -1)
     o.port := IntOr(portE.Value, -1)
@@ -2280,7 +2427,9 @@ SetStatusText(t, color) {               ; 反馈行只存在于专业模式（�
 }
 
 RefreshStatus() {
-    global st1, st2, st3, st4, st5, st6, tailE, gMonitorOn
+    global st1, st2, st3, st4, st5, st6, tailE, gMonitorOn, gRebuilding
+    if gRebuilding
+        return                                 ; 窗口正在重建：控件已经销毁，别碰
     o := CollectFields()
     st := QueryStatus(o.port > 0 ? o.port : 1339)
     sl := StateLine(st)
@@ -2348,8 +2497,8 @@ RefreshStatus() {
 }
 
 RefreshTick() {
-    global guiAlive, gDriverPid
-    if !guiAlive
+    global guiAlive, gDriverPid, gRebuilding
+    if (!guiAlive || gRebuilding)
         return
     ; 后台驱动（cmd 包装进程）没了 -> 说明这次启动/预览结束了，查一次日志尾部再报状态
     if (gDriverPid && !ProcessExist(gDriverPid)) {
@@ -2380,7 +2529,7 @@ BuildGui() {
     rShort := g.AddRadio("x22 y32 w110", "短模式（快）")
     rLong := g.AddRadio("x150 y32 w160", "长模式（长上下文）")
     rShort.Value := 1
-    g.AddText("x22 y56 w676 c404040", "短 = 20K ctx / k8v4 / MTP 开（--spec 3，专家在 GPU）/ KV 全常驻 / reserve 64（上限 39936）")
+    g.AddText("x22 y56 w676 c404040", "短 = 20K ctx / k8v4 / MTP 开（专家在 GPU 用 --spec 3；大量化改 cpu 用 --spec 2）/ KV 全常驻 / reserve 64（上限 39936）")
     g.AddText("x22 y74 w676 c404040", "长 = 80K ctx / KV 全常驻 / reserve 64 / MTP 开（--spec 2，专家在主机内存）/ 上限 81920（实测 65K prompt decode ~19-21 tok/s）")
     bndT := g.AddText("x22 y94 w676 c006400", "边界检查: —")
     rShort.OnEvent("Click", (*) => ApplyPreset("short"))
@@ -2837,6 +2986,7 @@ LoadSection(sec, mode) {
         p.mtp_mode := "cpu"          ; 长模式没有 gpu（专家全上 GPU 装不下 80K 上下文）
     p.mtp := (p.mtp_mode = "off") ? "off" : "on"
     p.mtp_cpu_moe := (p.mtp_mode = "cpu") ? "on" : "off"
+    p.spec := SpecForMtp(p.mtp_mode, mode)
     return p
 }
 
@@ -2895,7 +3045,8 @@ RunDriverCheck(o, tag) {                ; 跑驱动 --check，返回退出码与
 }
 
 Selftest() {
-    global selfBuf, DEV, gUiMode, gParams, gIgnoreIni, BASE_CFG, EXE, PY, DRIVER, RESULTS
+    global selfBuf, DEV, gUiMode, gParams, gIgnoreIni, BASE_CFG, EXE, PY, DRIVER, RESULTS, gLang, gPro, gSimple
+    gLang := "zh"                                    ; 自检报告固定中文，别受 ini / --en 影响
     global GUARD_PY, ROOT, SERVER_PY, sVisD, sMmprojE, sNativeE, sVisNoop
     selfBuf := ""
     SelfSay("TinyStrata 启动器 v" . APP_VER . " 自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
@@ -3206,6 +3357,23 @@ Selftest() {
                 SelfCheck("长模式的 MTP 选项里没有 gpu（专家全上 GPU 装不下 80K 上下文）", !hasGpu,
                     Join(MTP_LIST_LONG, ","))
             }
+            if (mode = "short") {
+                hasCpu := false
+                for v in MTP_LIST_SHORT
+                    if (v = "cpu")
+                        hasCpu := true
+                SelfCheck("短模式也提供 cpu（大量化在 4 GB 上必须：专家上 CPU）", hasCpu, Join(MTP_LIST_SHORT, ","))
+                ; 选 cpu：应带 --mtp-cpu-moe，且 --spec 换成 2（实测配套值）
+                mtpD.Text := "cpu"
+                cCpu := CollectFields()
+                aCpu := ArgsToStr(BuildArgs(cCpu, false))
+                SelfCheck("短模式 + cpu → --mtp-cpu-moe 1 且 --spec 2",
+                    (Prop(cCpu, "mtp_cpu_moe", "") = "on") && (Prop(cCpu, "spec", "") = "2")
+                    && InStr(aCpu, "--mtp-cpu-moe") && InStr(aCpu, "--spec "),
+                    "cpu_moe=" . Prop(cCpu, "mtp_cpu_moe", "") . " spec=" . Prop(cCpu, "spec", ""))
+                mtpD.Text := "gpu"                       ; 恢复默认（后面的用例依赖 gpu）
+                cc := CollectFields()
+            }
             if (mode = "short")
                 SelfCheck("短模式 MTP = gpu（不带 --mtp-cpu-moe）",
                     (Prop(c, "mtp_mode", "") = "gpu") && (Prop(c, "mtp_cpu_moe", "off") = "off"),
@@ -3329,7 +3497,11 @@ Selftest() {
             && (b1.color != b4.color) && (b1.glyph != b4.glyph) && (b3.glyph != b4.glyph))
         ; 状态判定表：端口没通时不能一律叫"异常"（模型加载那几分钟也是"进程在、端口没通"）
         SelfSay("      状态判定（anyProc, httpOk, httpStatus, driverAlive, 日志分钟 → 状态）：")
-        stCases := [[0, 0, 0, 0, -1, "stopped"], [1, 1, 200, 0, -1, "running"], [1, 1, 503, 0, -1, "loading"]
+        stCases := [[0, 0, 0, 0, -1, "stopped"], [1, 1, 200, 0, -1, "running"]
+            , [1, 1, 503, 0, 1, "loading"]              ; 503 但日志刚还在写 -> 真在加载
+            , [1, 1, 503, 1, 99, "loading"]             ; 503 但驱动还活着 -> 真在加载
+            , [1, 1, 503, 0, -1, "zombie"]              ; 503 且没人加载、日志也停 -> 上次的残留
+            , [1, 1, 503, 0, 99, "zombie"]
             , [1, 0, 0, 1, -1, "loading"], [1, 0, 0, 0, 1, "loading"], [1, 0, 0, 0, -1, "zombie"]
             , [1, 0, 0, 0, 99, "zombie"]]
         for c in stCases {
@@ -3339,6 +3511,21 @@ Selftest() {
         }
         SelfCheck("加载中会显示已等多久（或为空=没记录启动时刻）",
             (ElapsedText() = "" || InStr(ElapsedText(), "已等")), "[" . ElapsedText() . "]")
+        ; 切语言 = 销毁并重建两个窗口。曾经的崩法：点菜单后 5 秒定时器插进
+        ; "已销毁 / 还没建好"的窗口，CollectFields 读到死控件 → The control is destroyed。
+        langOk := false, langWhy := ""
+        try {
+            gPro := hg, gSimple := hg2           ; 给 RebuildUi 真实对象去销毁
+            SetLang("en", false)
+            enOk := (gLang = "en") && IsObject(gPro) && IsObject(gSimple)
+            SetLang("zh", false)
+            langOk := enOk && (gLang = "zh") && IsObject(gPro) && IsObject(gSimple)
+            hg := gPro, hg2 := gSimple           ; 重建后的新对象（下面还要销毁）
+        } catch as e {
+            langWhy := e.Message . " @" . e.Line
+        }
+        SelfCheck("切换语言（en → zh）：窗口能销毁重建，中途定时器不读死控件", langOk, langWhy . " lang=" . gLang)
+
         hg2.Destroy()
         hg.Destroy()
     } catch as e
