@@ -84,7 +84,7 @@ smaller quant wins and the i-quant path costs nothing extra.
 
 | File | Where |
 |---|---|
-| **`TinyStrata-Launcher.exe`** | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
+| **`TinyStrata-Launcher.exe`** (v0.1.0) | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
 | `strata.exe` + `strata.exe.sha256` | same release (61.7 MiB, CUDA 12.8 / sm_86) |
 | `strata-launcher.ahk` (optional) | this repo, [launcher/](launcher/) (only if you want to change the UI) |
 | `strata-run.py` (optional) | this repo, [tools/](tools/), the CLI driver |

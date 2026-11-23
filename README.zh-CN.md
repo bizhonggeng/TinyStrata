@@ -78,7 +78,7 @@ TinyStrata 就是这三堵墙的三个修复，外加用来量化它们的启动
 
 | 文件 | 从哪来 |
 |---|---|
-| **`TinyStrata-Launcher.exe`** | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（538 KiB，**不装 AutoHotkey 也能跑**） |
+| **`TinyStrata-Launcher.exe`**（v0.1.0） | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0)（538 KiB，**不装 AutoHotkey 也能跑**） |
 | `strata.exe` + `strata.exe.sha256` | 同上（61.7 MiB，CUDA 12.8 / sm_86） |
 | `strata-launcher.ahk`（可选） | 本仓库 [launcher/](launcher/)（想自己改界面才需要 AutoHotkey v2） |
 | `strata-run.py`（可选） | 本仓库 [tools/](tools/)，命令行驱动 |

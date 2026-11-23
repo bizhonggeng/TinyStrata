@@ -55,6 +55,7 @@ global GUARD_LOG := ""
 global TPL_DIR  := ""
 global gLocated := false  ; Locate() 有没有真的找到 strata.exe
 global gLocateHow := ""   ; 从哪个目录找到的（状态行要显示）
+global APP_VER := "0.1.0"       ; 启动器版本（与 Release tag 对齐）
 global gLang := "zh"            ; "zh" | "en"（InitLang() 里定）
 global EN := Map()
 global ENKeys := []
@@ -1933,7 +1934,7 @@ BuildGui() {
     opt := "-MaximizeBox"
     if ONTOP
         opt := "+AlwaysOnTop " . opt       ; 只有 --ontop 时才置顶（调试用）；正常使用不置顶
-    g := Gui(opt, Tf("TinyStrata 启动器"))
+    g := Gui(opt, Tf("TinyStrata 启动器") . "  v" . APP_VER)
     gHasGui := true
     g.SetFont("s9", "Segoe UI")
 
@@ -2204,13 +2205,13 @@ SwitchTo(mode, show := true) {
 
 BuildSimpleGui() {
     global
-    sg := Gui("-MaximizeBox", Tf("TinyStrata 启动器"))
+    sg := Gui("-MaximizeBox", Tf("TinyStrata 启动器") . "  v" . APP_VER)
     gHasGui := true
     if ONTOP
         sg.Opt("+AlwaysOnTop")
     sg.SetFont("s10", "Segoe UI")
 
-    sg.AddText("x22 y14 w300", "TinyStrata 启动器")
+    sg.AddText("x22 y14 w300", "TinyStrata 启动器  v" . APP_VER)
     sg.AddButton("x344 y8 w108 h28", "专业模式 →").OnEvent("Click", (*) => SwitchTo("pro"))
 
     sg.AddGroupBox("x8 y44 w444 h48", "模式")
@@ -2406,7 +2407,7 @@ RunDriverCheck(o, tag) {                ; 跑驱动 --check，返回退出码与
 Selftest() {
     global selfBuf, DEV, gUiMode, gParams, gIgnoreIni
     selfBuf := ""
-    SelfSay("TinyStrata 启动器自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
+    SelfSay("TinyStrata 启动器 v" . APP_VER . " 自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
 
     SelfSay("`n--- 1. 文件 ---")
     SelfCheck("引擎 strata.exe  " . EXE, FileExist(EXE))
