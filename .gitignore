@@ -1,0 +1,24 @@
+# engine / build artefacts
+build*/
+engine-*/
+*.exe
+*.dll
+*.obj
+*.pdb
+*.lib
+
+# runtime output
+results/
+sessions/
+*.log
+*.sess
+scratch/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# models and packs are never in the tree
+*.gguf
+*.bin

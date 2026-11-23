@@ -1,0 +1,650 @@
+From 8d17d13f00e043aa4fa59cd35dae349192754d93 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 11:25:56 +0800
+Subject: [PATCH 3/3] serve/setup/tools: session autosave, log timestamps,
+ --chat-template-file, quant list
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+serve/autosave.py: a disk fallback for parked conversations — a conversation that
+parking skipped (RAM floor) is saved to slot_save_path/autosave and restored when
+the client comes back. serve/server.py: HH:MM:SS on every log line (the engine's
+stderr goes through a relay thread), --chat-template-file (llama.cpp's option), and
+the autosave hook. setup.py: three more i-quants selectable for Qwen3.6-35B-A3B
+(UD-IQ3_XXS, UD-IQ2_M, UD-IQ2_XXS) — the whitelist was a pinned-sha256 list, not a
+format limit.
+---
+ serve/autosave.py       | 181 ++++++++++++++++++++++++++++++++++++++++
+ serve/server.py         | 129 +++++++++++++++++++++++++++-
+ setup.py                |  15 ++++
+ tools/gguf_reader.py    |   1 +
+ tools/strata_inspect.py | 102 ++++++++++++++++++----
+ 5 files changed, 412 insertions(+), 16 deletions(-)
+ create mode 100644 serve/autosave.py
+
+diff --git a/serve/autosave.py b/serve/autosave.py
+new file mode 100644
+index 00000000..a013e6d8
+--- /dev/null
++++ b/serve/autosave.py
+@@ -0,0 +1,181 @@
++"""Session autosave (#local): a disk fallback for the conversation cache's parked sessions.
++
++The engine parks whole conversations in host RAM (`--conversation-cache-mib`); a client that
++switches between several long conversations gets each one back through the front - a 52K-token
++conversation returns in under a second instead of minutes of re-reading.  When the RAM floor
++(`--conversation-cache-min-free-mib`) or the cache budget does not fit the snapshot, the engine
++skips parking ("conversation cache: skip parking ...") and the switch back re-reads everything.
++
++This module closes that gap on the server side, without touching the engine or the clients:
++
++  * after a request whose prompt was long enough, SAVE the engine's live conversation to
++    `slot_save_path/autosave/<fingerprint>.sess` (throttled: only when it grew by a step);
++  * before running a request whose fingerprint differs from the last active one, RESTORE the
++    saved file when there is one.  The engine then matches its token prefix and reuses the
++    whole KV - exactly the parking path, from the disk.
++
++The fingerprint is sha256 over the first message's role and text content, so it is stable
++across the turns of one conversation and changes when the conversation is compacted (a
++compacted conversation is a new chain; re-reading its short summary is the same the parking
++path does).  Files carry an `autosave-` prefix and are pruned LRU-style; names a client saves
++itself through POST /slots/0 are never touched.
++
++Every step is best effort: a restore of a stale file only costs its read time (the engine
++falls back to reading the prompt), a failed save costs a log line.  Nothing here can change a
++reply's content.  The whole feature is off unless the server runs with `--slot-save-path` and
++STRATA_AUTOSAVE_MIN_TOKENS > 0."""
++
++import hashlib
++import os
++import threading
++import time
++
++AUTOSAVE_DIR = "autosave"
++PREFIX = "autosave-"
++SUFFIX = ".sess"
++
++AUTOSAVE_DIR = "autosave"
++PREFIX = "autosave-"
++SUFFIX = ".sess"
++
++
++class AutoSave:
++    """The autosave index and the save/restore decisions.  One instance per Service; all
++    calls happen on the request path, which the server serializes (the engine is FIFO), so a
++    simple lock around the index is enough."""
++
++    def __init__(self, slot_save_path: str | None):
++        self.dir = os.path.join(slot_save_path, AUTOSAVE_DIR) if slot_save_path else None
++        self.min_tokens = _env_int("STRATA_AUTOSAVE_MIN_TOKENS", 4096)
++        self.step_tokens = _env_int("STRATA_AUTOSAVE_STEP_TOKENS", 2048)
++        self.keep = _env_int("STRATA_AUTOSAVE_KEEP", 8)
++        self.lock = threading.Lock()
++        self.active_fp: str | None = None          # the fingerprint of the session the engine holds now
++        self.active_tokens = 0                      # its prompt size at the last save
++        self.index: dict[str, dict] = {}            # fp -> {"file": name, "tokens": N, "at": ts}
++        if self.dir and self.min_tokens > 0:
++            try:
++                os.makedirs(self.dir, exist_ok=True)
++            except OSError as e:
++                print(f"[strata] autosave off: cannot create {self.dir}: {e}", flush=True)
++                self.dir = None
++
++    @property
++    def enabled(self) -> bool:
++        return bool(self.dir) and self.min_tokens > 0
++
++    def on(self) -> str:
++        """A one-line description for the startup log."""
++        if not self.enabled:
++            return "session autosave off" + ("" if self.dir else " (needs --slot-save-path)") \
++                if self.min_tokens > 0 else "session autosave off (STRATA_AUTOSAVE_MIN_TOKENS=0)"
++        return (f"session autosave on: {self.dir} (min {self.min_tokens} tokens, step "
++                f"{self.step_tokens}, keep {self.keep})")
++
++    # ---- decisions -------------------------------------------------------
++
++    def restore_wanted(self, fp: str | None) -> bool:
++        """True when the incoming request's session differs from the one the engine holds and
++        there is a saved file for it."""
++        if not self.enabled or fp is None or fp == self.active_fp:
++            return False
++        return fp in self.index
++
++    def save_wanted(self, fp: str | None, prompt_tokens: int) -> bool:
++        """True when the finished request's conversation is long enough and grew by a step
++        since the last save of this session."""
++        if not self.enabled or fp is None or prompt_tokens < self.min_tokens:
++            return False
++        if fp == self.active_fp and prompt_tokens - self.active_tokens < self.step_tokens:
++            return False                            # nothing worth writing since the last save
++        if fp != self.active_fp:
++            prev = self.index.get(fp)
++            if prev and prompt_tokens - prev["tokens"] < self.step_tokens:
++                return False                        # the file on disk is recent enough
++        return True
++
++    # ---- actions ---------------------------------------------------------
++
++    def restore(self, svc, fp: str) -> None:
++        """RESTORE the session file for `fp` (the caller holds the request's serialization:
++        engine work is FIFO).  Best effort: any failure only logs."""
++        entry = self.index.get(fp)
++        if not entry:
++            return
++        try:
++            r = svc.engine.session_file("restore", os.path.join(self.dir, entry["file"]))
++            self.active_fp, self.active_tokens = fp, entry["tokens"]
++            print(f"[strata] autosave: restored {r.get('tokens', entry['tokens'])} tokens from {entry['file']} "
++                  f"({r.get('ms', 0):.0f} ms)", flush=True)
++        except Exception as e:                      # noqa: BLE001 - a miss must not fail the request
++            print(f"[strata] autosave: restore failed ({e}); the engine reads the prompt", flush=True)
++            self.index.pop(fp, None)                # the file is no use to anyone
++            self.active_fp = None
++
++    def save(self, svc, fp: str, prompt_tokens: int) -> None:
++        """SAVE the engine's live conversation for `fp`.  Best effort, and throttled by
++        save_wanted(); the caller runs this after the reply, still between requests."""
++        name = f"{PREFIX}{fp}{SUFFIX}"
++        try:
++            r = svc.engine.session_file("save", os.path.join(self.dir, name))
++            self.index[fp] = {"file": name, "tokens": prompt_tokens, "at": time.time()}
++            self.active_fp, self.active_tokens = fp, prompt_tokens
++            self._prune()
++            ms = r.get("ms", 0)
++            mb = r.get("bytes", 0) / 1048576
++            print(f"[strata] autosave: saved {prompt_tokens} tokens ({mb:.0f} MiB, {ms:.0f} ms) "
++                  f"to {name}; sessions on disk: {len(self.index)}", flush=True)
++        except Exception as e:                      # noqa: BLE001
++            print(f"[strata] autosave: save failed ({e})", flush=True)
++
++    def note_active(self, fp: str | None, prompt_tokens: int = 0) -> None:
++        """Record which session the engine now holds, without saving (a restore by a client,
++        a short conversation, anything that changes the live session behind our back)."""
++        with self.lock:
++            if fp != self.active_fp:
++                self.active_fp, self.active_tokens = fp, prompt_tokens
++
++    def forget(self) -> None:
++        """The engine ended (a restart empties its RAM and its live session): nothing is
++        active any more.  The index survives - the files are still good for a restore."""
++        self.active_fp = None
++
++    def _prune(self) -> None:
++        """Keep at most `keep` autosave files (never the active one), oldest first."""
++        if len(self.index) <= self.keep:
++            return
++        for fp, entry in sorted(self.index.items(), key=lambda kv: kv[1]["at"]):
++            if len(self.index) <= self.keep:
++                break
++            if fp == self.active_fp:
++                continue
++            try:
++                os.remove(os.path.join(self.dir, entry["file"]))
++            except OSError:
++                pass
++            self.index.pop(fp, None)
++
++
++def fingerprint(messages) -> str | None:
++    """sha256 over the first message's role and text content: stable across the turns of one
++    conversation, changes on compaction (a compacted conversation is a new chain - the same
++    re-reading the parking path does).  None when there is nothing to key on (no messages, no
++    text part)."""
++    for m in messages or []:
++        if not isinstance(m, dict):
++            continue
++        content = m.get("content")
++        if isinstance(content, str) and content:
++            h = hashlib.sha256()
++            h.update(m.get("role", "").encode("utf-8", "replace"))
++            h.update(b"\x00")
++            h.update(content.encode("utf-8", "replace"))
++            return h.hexdigest()[:16]
++    return None
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return max(0, int(os.environ.get(name, "") or default))
++    except ValueError:
++        return default
+diff --git a/serve/server.py b/serve/server.py
+index 354b65b1..6805d03d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -64,11 +64,53 @@ from serve.winjob import contain  # noqa: E402
+ from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+ from serve import responses as responses_api  # noqa: E402
+ from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
++from serve.autosave import AutoSave, fingerprint as autosave_fingerprint  # noqa: E402
+ 
+ IM_END = "<|im_end|>"
+ IMAGE_PAD = "<|image_pad|>"
+ 
+ 
++class _Stamped:
++    """一条 stdout/stderr 包装：每行前面加 HH:MM:SS（本地时间）。
++
++    只缓冲“还没遇到换行”的尾巴，遇到换行就整行写出并 flush，所以 `print(..., flush=True)`
++    与子进程/线程交错写都不会把半行戳上时间戳。`log_timestamps: false` 时不安装。"""
++
++    def __init__(self, stream):
++        self._s = stream
++        self._buf = ""
++        self._lock = threading.Lock()
++
++    def write(self, data):
++        if not data:
++            return 0
++        with self._lock:
++            self._buf += data
++            while "\n" in self._buf:
++                line, self._buf = self._buf.split("\n", 1)
++                self._s.write(time.strftime("%H:%M:%S ") + line + "\n")
++            self._s.flush()
++        return len(data)
++
++    def flush(self):
++        with self._lock:
++            if self._buf:
++                self._s.write(time.strftime("%H:%M:%S ") + self._buf)
++                self._buf = ""
++            self._s.flush()
++
++    def __getattr__(self, name):
++        return getattr(self._s, name)
++
++
++def install_log_timestamps():
++    """把所有 print() 输出（stdout/stderr）逐行加上 HH:MM:SS。幂等。"""
++    for name in ("stdout", "stderr"):
++        cur = getattr(sys, name)
++        if not isinstance(cur, _Stamped):
++            setattr(sys, name, _Stamped(cur))
++
++
+ def popen(what: str, args: list, **kw):
+     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
+     Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
+@@ -142,6 +184,7 @@ VISION_START = "<|vision_start|>"
+ # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
+ # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
+ # sets it; 0 turns it off.
++LOG_TIMESTAMPS = True          # 每行日志加 HH:MM:SS（配置 "log_timestamps": false 或 --no-log-timestamps 关）
+ REPEAT_STOP_TOKENS = 256
+ ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+@@ -668,8 +711,12 @@ class StrataEngine:
+         pin = {}
+         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
+             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
++        log_pump = self.log not in (None, subprocess.DEVNULL) and LOG_TIMESTAMPS
++        stderr_arg = subprocess.PIPE if log_pump else self.log
+         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
++                          stdout=subprocess.PIPE, stderr=stderr_arg, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
++        if log_pump:                                     # 引擎 stderr 走管道：这里逐行加时间戳再写日志
++            threading.Thread(target=self._log_pump, args=(self.proc, self.log), daemon=True).start()
+         contain(self.proc)                               # ends with the server, however it ends (Windows)
+         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
+         # stays for _pump (one reader at a time)
+@@ -993,6 +1040,19 @@ class StrataEngine:
+                 keys += f" penalty_last_n={pln}"
+             else:
+                 keys += " penalty_last_n=64"
++        # DRY (llama.cpp's sampler): 按重复序列长度加惩罚，专打"逐字复现上一段"
++        dm = sampling.get("dry_multiplier")
++        if isinstance(dm, (int, float)) and float(dm) > 0.0:
++            keys += f" dry_multiplier={float(dm)!r}"
++            db = sampling.get("dry_base")
++            if isinstance(db, (int, float)) and float(db) > 1.0:
++                keys += f" dry_base={float(db)!r}"
++            da = sampling.get("dry_allowed_length")
++            if isinstance(da, int) and not isinstance(da, bool) and da >= 0:
++                keys += f" dry_allowed_length={da}"
++            dl = sampling.get("dry_penalty_last_n")
++            if isinstance(dl, int) and not isinstance(dl, bool) and dl > 0:
++                keys += f" dry_penalty_last_n={dl}"
+         seed = sampling.get("seed")
+         if isinstance(seed, int) and seed > 0:
+             keys += f" seed={seed}"
+@@ -1800,6 +1860,29 @@ class StrataEngine:
+             pass
+         return EngineSilent(f"{what}; the server ended the engine")
+ 
++    def _log_pump(self, proc, log):
++        """把引擎的 stderr 逐行搬到日志文件，每行加 HH:MM:SS（LOG_TIMESTAMPS 打开时）。
++
++        必须一直读到 EOF：管道满了而不排空，引擎会阻塞在写 stderr 上。"""
++        lock = getattr(log, "_strata_lock", None)
++        if lock is None:
++            lock = threading.Lock()
++            try:
++                log._strata_lock = lock
++            except AttributeError:
++                pass
++        try:
++            for line in proc.stderr:
++                stamp = time.strftime("%H:%M:%S ")
++                with lock:
++                    try:
++                        log.write(stamp + line)
++                        log.flush()
++                    except (OSError, ValueError):
++                        return
++        except (OSError, ValueError):
++            return
++
+     def session_file(self, action: str, path: str) -> dict:
+         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
+@@ -2808,6 +2891,7 @@ class Service:
+         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
+         self.fifo = threading.Lock()
+         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
++        self.autosave = None                          # serve/autosave.py: a disk fallback for parked conversations (on when slot_save_path is set)
+         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
+@@ -4437,6 +4521,18 @@ def openai_collect(chunks) -> dict:
+     return out
+ 
+ 
++def autosave_after(svc, fp: str, prompt_tokens: int, chunks):
++    """#local: yield the chunks through, then (still between requests) save the conversation
++    to disk when autosave wants to.  Works for both the streamed and the collected path: both
++    iterate this generator to the end."""
++    try:
++        yield from chunks
++    finally:
++        a = svc.autosave
++        if a and a.save_wanted(fp, prompt_tokens):
++            a.save(svc, fp, prompt_tokens)
++
++
+ def structured_chunks(chunks, validator):
+     """Buffer structured streams so a client never receives unvalidated content."""
+     buffered = []
+@@ -5373,6 +5469,9 @@ def make_handler(svc: Service):
+             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
++            fp = autosave_fingerprint(messages)               # #local: disk fallback for parked conversations
++            if svc.autosave and fp and svc.autosave.restore_wanted(fp) and len(ids) >= svc.autosave.min_tokens:
++                svc.autosave.restore(svc, fp)
+             cancel = threading.Event()
+             self._watch_client(cancel)                       # #430 #431
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+@@ -5381,6 +5480,8 @@ def make_handler(svc: Service):
+             if validator is not None:
+                 chunks = structured_chunks(chunks, validator)
+             chunks = self._capture(chunks, "openai")
++            if svc.autosave and fp:
++                chunks = autosave_after(svc, fp, len(ids), chunks)   # #local: save when the stream ends
+             if not req.get("stream"):
+                 return self._json(200, openai_collect(chunks))
+             self._sse()
+@@ -5577,6 +5678,7 @@ def make_handler(svc: Service):
+             read for the same request, rendered and tokenized - the model does not run."""
+             req = svc.with_shared(req, "anthropic")
+             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
++            fp = autosave_fingerprint(messages)                   # #local: disk fallback for parked conversations
+             stop_strings(req)                                 # the same 400 as the request itself would get
+             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
+             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+@@ -5595,10 +5697,14 @@ def make_handler(svc: Service):
+             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
++            if svc.autosave and fp and svc.autosave.restore_wanted(fp) and len(ids) >= svc.autosave.min_tokens:
++                svc.autosave.restore(svc, fp)                 # #local: disk fallback for parked conversations
+             cancel = threading.Event()
+             self._watch_client(cancel)                       # #430 #431
+             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+             events = self._capture(events, "anthropic")
++            if svc.autosave and fp:
++                events = autosave_after(svc, fp, len(ids), events)   # #local: save when the stream ends
+             if not req.get("stream"):
+                 return self._json(200, anthropic_collect(events))
+             self._sse()
+@@ -6164,6 +6270,12 @@ def main() -> int:
+                                   "(\"0,2\"; also \"gpu\" in the config)")
+     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
+                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
++    ap.add_argument("--no-log-timestamps", action="store_true",
++                    help="log lines without an HH:MM:SS prefix (also \"log_timestamps\": false in the config)")
++    ap.add_argument("--chat-template-file", default=None, metavar="FILE",
++                    help="a Jinja chat template file to use instead of the tokenizer directory's "
++                         "chat_template.jinja (also \"chat_template_file\" in the config); llama.cpp's "
++                         "--chat-template-file")
+     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
+     ap.add_argument("--fit-max-tokens", action="store_true",
+                     help="clamp max_tokens to the remaining context instead of rejecting the request "
+@@ -6197,6 +6309,11 @@ def main() -> int:
+     a = ap.parse_args()
+     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+     lift_reasoning_effort_arg(cfg)
++    # 日志时间戳：默认开，配置里 "log_timestamps": false 关掉（服务端 print 与引擎 stderr 都加 HH:MM:SS）
++    global LOG_TIMESTAMPS
++    LOG_TIMESTAMPS = cfg.get("log_timestamps", True) is not False
++    if LOG_TIMESTAMPS and not a.no_log_timestamps:
++        install_log_timestamps()
+     if a.replicas is not None:
+         cfg["replicas"] = a.replicas
+     if a.gpu is not None:
+@@ -6285,7 +6402,13 @@ def main() -> int:
+         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
+             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+     # the model's own chat template (exported with its tokenizer), else the original model's
+-    tpl = tpath / "chat_template.jinja"
++    tpl_override = a.chat_template_file or cfg.get("chat_template_file")
++    if tpl_override:
++        tpl_override = Path(tpl_override)
++        if not tpl_override.exists():
++            ap.error(f"chat template file not found: {tpl_override}")
++        print(f"[strata] chat template: {tpl_override} (--chat-template-file)", flush=True)
++    tpl = tpl_override if tpl_override else tpath / "chat_template.jinja"
+     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                   sampling_defaults=sampling_defaults,
+@@ -6363,6 +6486,8 @@ def main() -> int:
+             raise SystemExit(f"[strata] {e}")
+         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
+               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
++    svc.autosave = AutoSave(svc.slot_save_path)          # a disk fallback for parked conversations (#local)
++    print(f"[strata] {svc.autosave.on()}", flush=True)
+     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
+     if mode not in ("model", "on_request"):
+         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+diff --git a/setup.py b/setup.py
+index 30d071f8..384c1488 100644
+--- a/setup.py
++++ b/setup.py
+@@ -251,6 +251,21 @@ MODELS = {
+                           # 18,209,036,576 bytes; experts 14.17 GiB = 15.2 GB (measured: the engine's "loaded 14.17 GiB")
+                           "download_gb": 18.2, "ram_gb": 26, "arena_gb": 15.2, "families": ("qwen36",),
+                           "engine": QWEN36_ENGINE},
++    # 本地补丁（2026-11-20）：白名单原本只钉了 UD-IQ3_S / UD-IQ4_XS 两个文件（sha256 pin），
++    # 但引擎的原生专家内核与 pack 流程都与量化无关（内核没覆盖的类型回退到 ggml-cpu 的 dot）。
++    # 这三个是同 family 的 i-quant；未钉哈希 = 下载后不校验 sha256（setup 只校验已钉的文件）。
++    "Qwen3.6-UD-IQ3_XXS": {"size": "UD-IQ3_XXS",
++                         "about": "~3-bit i-quant (Unsloth Dynamic): 比 IQ3_S 小 1.2 GB, RAM 余量更多",
++                         "download_gb": 14.1, "ram_gb": 22, "arena_gb": 11.9, "families": ("qwen36",),
++                         "engine": QWEN36_ENGINE},
++    "Qwen3.6-UD-IQ2_M": {"size": "UD-IQ2_M",
++                         "about": "~2-bit i-quant (Unsloth Dynamic): 更小, 质量换内存",
++                         "download_gb": 11.9, "ram_gb": 20, "arena_gb": 10.1, "families": ("qwen36",),
++                         "engine": QWEN36_ENGINE},
++    "Qwen3.6-UD-IQ2_XXS": {"size": "UD-IQ2_XXS",
++                         "about": "~2-bit i-quant (Unsloth Dynamic): 最小的一档, 质量下降明显",
++                         "download_gb": 11.8, "ram_gb": 20, "arena_gb": 10.0, "families": ("qwen36",),
++                         "engine": QWEN36_ENGINE},
+     "Qwen3.6-UD-IQ3_S": {"size": "UD-IQ3_S", "about": "~3.5-bit i-quant (Unsloth Dynamic), smaller: for 16-24 GB of "
+                                                       "RAM (16 GB: a 12 GB card, the low-RAM mode)",
+                          # 15,346,432,288 bytes; experts 11.99 GiB = 12.9 GB (measured: the engine's "loaded 11.99 GiB")
+diff --git a/tools/gguf_reader.py b/tools/gguf_reader.py
+index 237d5fdb..99c8f186 100644
+--- a/tools/gguf_reader.py
++++ b/tools/gguf_reader.py
+@@ -45,6 +45,7 @@ BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
+     "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ3_XXS": (256, 98), "IQ1_S": (256, 50),
+     "IQ4_NL": (32, 18), "IQ3_S": (256, 110), "IQ2_S": (256, 82), "IQ4_XS": (256, 136),
+     "IQ1_M": (256, 56), "Q2_0": (64, 18), "MXFP4": (32, 17), "NVFP4": (64, 36),
++    "TQ1_0": (256, 54), "TQ2_0": (256, 66),
+ }
+ 
+ 
+diff --git a/tools/strata_inspect.py b/tools/strata_inspect.py
+index 66cb727c..4aeb4566 100644
+--- a/tools/strata_inspect.py
++++ b/tools/strata_inspect.py
+@@ -28,7 +28,8 @@ sys.path.insert(0, str(ROOT / "tools"))
+ import quantscope as qs  # noqa: E402
+ 
+ FINGERPRINTS = ROOT / "data" / "gguf_fingerprints.json"
+-ARCH = "qwen4exp"                                       # Qwen3.8-Flash-Next's general.architecture
++# the architectures the engine accepts (src/core/layout.cpp: "this engine runs ... and ...")
++ARCHS = ("qwen4exp", "qwen35moe")                       # Qwen3.8-Flash-Next, Qwen3.6-35B-A3B (and its fine-tunes)
+ 
+ # the files setup installs: (family, model, ModelScope repository, file name prefix) - for --fingerprints
+ KNOWN = [
+@@ -45,14 +46,15 @@ KNOWN = [
+ ]
+ 
+ 
+-def read_headers(files: list) -> tuple[str | None, list[dict]]:
+-    """The architecture and every tensor of a model's shards (headers only)."""
+-    arch, tensors = None, []
++def read_headers(files: list) -> tuple[str | None, list[dict], dict]:
++    """The architecture, every tensor of a model's shards, and the first shard's metadata (headers only)."""
++    arch, tensors, meta = None, [], {}
+     for f in files:
+-        meta, ts = qs.read_gguf(f)
+-        arch = arch or meta.get("general.architecture")
++        m, ts = qs.read_gguf(f)
++        arch = arch or m.get("general.architecture")
++        meta = meta or m
+         tensors += ts
+-    return arch, tensors
++    return arch, tensors, meta
+ 
+ 
+ def role(name: str) -> str:
+@@ -92,8 +94,12 @@ def verdict(fp: dict, table: dict) -> tuple[str, str]:
+     layout as one: a fine-tune made with the same recipe, untested), "no" (Strata cannot run it) or "untested"
+     (naming the tensors whose quantization no file Strata runs has for them)."""
+     known = {k: v for k, v in table.items() if not k.startswith("_")}
+-    if fp["arch"] != ARCH:
+-        return "no", f"not Qwen3.8-Flash-Next (architecture {fp['arch']!r}): Strata runs only that model"
++    if fp["arch"] not in ARCHS:
++        return "no", (f"architecture {fp['arch']!r}: Strata runs only " + " and ".join(ARCHS) +
++                      " (Qwen3.8-Flash-Next and Qwen3.6-35B-A3B)")
++    if fp["arch"] == "qwen35moe":
++        return "geometry", ("architecture qwen35moe (the Qwen3.6-35B-A3B family): the engine accepts it, but this "
++                            "family is not in setup's table - test it with --inspect on this PC before relying on it")
+     exact = [k for k, v in known.items() if v["expert_bytes"] == fp["expert_bytes"] and v["bytes"] == fp["bytes"]
+              and v["tensors"] == fp["tensors"]]
+     if exact:
+@@ -120,6 +126,72 @@ def verdict(fp: dict, table: dict) -> tuple[str, str]:
+     return "untested", head + "; every tensor uses a quantization some file Strata runs has for it"
+ 
+ 
++# the engine's own caps (src/core/layout.cpp: ModelGeometry's defaults and its bad() calls).  A file that differs is
++# refused with "qwen35moe: <key> is <got>; this engine supports <want>".
++QWEN35MOE_CAPS = {"layers": 48, "mtp": 1, "embd": 2560, "head": 24, "head_kv": 2,
++                  "ssm_k": 16, "ssm_v": 48, "experts": 512, "used": 10, "ff": 640}
++QWEN35MOE_REQUIRED = ("block_count", "embedding_length", "full_attention_interval", "attention.head_count",
++                      "attention.head_count_kv", "attention.key_length", "attention.value_length",
++                      "rope.dimension_count", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank",
++                      "ssm.conv_kernel", "ssm.inner_size", "expert_count", "expert_used_count",
++                      "expert_feed_forward_length", "expert_shared_feed_forward_length")
++
++
++def qwen35moe_geometry(meta: dict) -> tuple[str, str]:
++    """Mirror of the engine's qwen35moe checks (src/core/layout.cpp: geometry_from_gguf).
++
++    A header reading: this says whether the engine gets past its geometry door, not how well the model answers.
++    """
++    def num(name, default=None):
++        v = meta.get("qwen35moe." + name)
++        return int(v) if isinstance(v, (int, float)) and float(v).is_integer() else (default if v is None else v)
++
++    missing = [k for k in QWEN35MOE_REQUIRED if num(k) is None]
++    if missing:
++        return "no", f"it has no qwen35moe.{missing[0]}: the engine needs that key"
++    layers = num("block_count") - (num("nextn_predict_layers", 0) or 0)
++    mtp = num("nextn_predict_layers", 0) or 0
++    bad = []
++    for k, want in (("attention.key_length", 256), ("attention.value_length", 256),
++                    ("rope.dimension_count", 64), ("ssm.state_size", 128), ("ssm.conv_kernel", 4),
++                    ("full_attention_interval", 4), ("attention.head_count_kv", 2)):
++        if num(k) != want:
++            bad.append(f"{k}={num(k)} (needs {want})")
++    if not (0 < layers <= QWEN35MOE_CAPS["layers"] and layers % 4 == 0):
++        bad.append(f"block_count-nextn={layers} (a multiple of 4, at most 48)")
++    if not 0 <= mtp <= QWEN35MOE_CAPS["mtp"]:
++        bad.append(f"nextn_predict_layers={mtp} (0 or 1)")
++    if not (0 < num("embedding_length") <= QWEN35MOE_CAPS["embd"] and num("embedding_length") % 256 == 0):
++        bad.append(f"embedding_length={num('embedding_length')} (a multiple of 256, at most 2560)")
++    if not 0 < num("attention.head_count") <= QWEN35MOE_CAPS["head"]:
++        bad.append(f"attention.head_count={num('attention.head_count')} (at most 24)")
++    if not 0 < num("ssm.group_count") <= QWEN35MOE_CAPS["ssm_k"]:
++        bad.append(f"ssm.group_count={num('ssm.group_count')} (at most 16)")
++    if not 0 < num("ssm.time_step_rank") <= QWEN35MOE_CAPS["ssm_v"]:
++        bad.append(f"ssm.time_step_rank={num('ssm.time_step_rank')} (at most 48)")
++    if num("ssm.inner_size") != num("ssm.state_size") * num("ssm.time_step_rank"):
++        bad.append("ssm.inner_size != ssm.state_size * ssm.time_step_rank")
++    if num("ssm.time_step_rank") % num("ssm.group_count"):
++        bad.append("ssm.time_step_rank is not a multiple of ssm.group_count")
++    if num("attention.head_count") % num("attention.head_count_kv"):
++        bad.append("attention.head_count is not a multiple of attention.head_count_kv")
++    if not 0 < num("expert_count") <= QWEN35MOE_CAPS["experts"]:
++        bad.append(f"expert_count={num('expert_count')} (at most 512)")
++    if not 0 < num("expert_used_count") <= QWEN35MOE_CAPS["used"]:
++        bad.append(f"expert_used_count={num('expert_used_count')} (at most 10)")
++    if not (0 < num("expert_feed_forward_length") <= QWEN35MOE_CAPS["ff"]
++            and num("expert_feed_forward_length") % 256 == 0):
++        bad.append(f"expert_feed_forward_length={num('expert_feed_forward_length')} (a multiple of 256, at most 640)")
++    if num("expert_shared_feed_forward_length") != num("expert_feed_forward_length"):
++        bad.append("expert_shared_feed_forward_length != expert_feed_forward_length")
++    if bad:
++        return "no", ("architecture qwen35moe, but the engine refuses its geometry: " + "; ".join(bad))
++    mtp_note = "with an MTP layer" if mtp else "no MTP layer (speculative decoding is lost)"
++    return "geometry", (f"architecture qwen35moe: its geometry passes the engine's checks ({layers} layers, "
++                        f"{num('embedding_length')} wide, {num('expert_count')} experts, "
++                        f"{num('expert_used_count')} a token, {mtp_note}) - test it before relying on it")
++
++
+ def make_fingerprints(out: Path) -> None:
+     listing, table = {}, {}
+     for fam, model, repo, prefix in KNOWN:
+@@ -127,7 +199,7 @@ def make_fingerprints(out: Path) -> None:
+             listing[repo] = qs.list_hub("ms", repo)
+         files = sorted((f for f in listing[repo] if f.name.startswith(prefix) and f.name.endswith(".gguf")),
+                        key=lambda f: f.name)
+-        table[f"{fam}/{model}"] = {**fingerprint(*read_headers(files)), "files": [f.name for f in files], "repo": repo}
++        table[f"{fam}/{model}"] = {**fingerprint(*read_headers(files)[:2]), "files": [f.name for f in files], "repo": repo}
+         print(f"{fam}/{model}: experts {table[f'{fam}/{model}']['experts_bpw']} bits/weight", file=sys.stderr)
+     union: dict[str, set] = defaultdict(set)
+     for v in table.values():
+@@ -164,12 +236,14 @@ def main() -> None:
+         sys.exit(f"no variant matches {a.variant!r}")
+     name, fs = next(iter(chosen.items()))
+     fs = sorted(fs, key=lambda f: f.name)
+-    arch, tensors = read_headers(fs)
++    arch, tensors, meta = read_headers(fs)
+     qs.summarize(name, tensors)
+-    fp = fingerprint(arch, tensors)
+-    kind, sentence = verdict(fp, load_fingerprints())
++    if arch == "qwen35moe":
++        kind, sentence = qwen35moe_geometry(meta)
++    else:
++        kind, sentence = verdict(fingerprint(arch, tensors), load_fingerprints())
+     print(f"\nStrata: {sentence}")
+-    sys.exit(0 if kind in ("known", "layout") else 2 if kind == "no" else 0)
++    sys.exit(0 if kind in ("known", "layout", "geometry") else 2 if kind == "no" else 0)
+ 
+ 
+ if __name__ == "__main__":

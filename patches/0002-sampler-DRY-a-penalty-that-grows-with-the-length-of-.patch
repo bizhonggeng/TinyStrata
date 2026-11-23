@@ -1,0 +1,188 @@
+From 92812b48ccb5ba07162c7e0cda1afdb75cbefd91 Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 11:25:55 +0800
+Subject: [PATCH 2/3] =?UTF-8?q?sampler:=20DRY=20=E2=80=94=20a=20penalty=20?=
+ =?UTF-8?q?that=20grows=20with=20the=20length=20of=20a=20repeated=20sequen?=
+ =?UTF-8?q?ce?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+llama.cpp's DRY sampler as a pre-pass on the logits: one block per row finds the
+repeated sequences in that row's history and the tokens that followed them, then
+scatters the penalty onto those tokens only. Every sampler path (greedy, sampled,
+split/merge verify) sees it without a kernel of its own to change.
+
+Off by default (dry_multiplier 0 = no kernel launched, bit-exact); --dry-multiplier,
+--dry-base, --dry-allowed-length, --dry-penalty-last-n, and the same keys on the GEN
+line.
+
+Measured: a coding prompt that burned 700 tokens of silent thinking and produced no
+answer at dry 0 produced the correct function at dry 1.5.
+---
+ include/strata/kernels/sampler.hpp | 13 +++++++
+ src/kernels/cuda/sampler.cu        | 60 ++++++++++++++++++++++++++++++
+ src/program/generate.cpp           | 11 ++++++
+ 3 files changed, 84 insertions(+)
+
+diff --git a/include/strata/kernels/sampler.hpp b/include/strata/kernels/sampler.hpp
+index a3121ba1..35a52c3d 100644
+--- a/include/strata/kernels/sampler.hpp
++++ b/include/strata/kernels/sampler.hpp
+@@ -27,8 +27,21 @@ struct SamplerParams {
+     bool greedy = false;
+     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
+     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
++    // ---- DRY: a penalty that grows with the length of a REPEATED SEQUENCE, not with how often one token appeared.
++    // llama.cpp's sampler; the token/presence penalties cannot see "the same three sentences again", which is the
++    // loop a long reasoning turn falls into.
++    float dry_multiplier = 0.0f; // 0 = off (bit-exact: no kernel is launched)
++    float dry_base = 1.75f;      // penalty = multiplier * base^(match_len - allowed)
++    int dry_allowed = 2;         // matches shorter than this are not penalised
++    int dry_last_n = 64;         // the window over `history` the matches are looked for in (<= history_len)
+ };
+ 
++// DRY as a PRE-PASS on the logits: each row's repeated-sequence penalties are subtracted in place before any sampler
++// kernel runs, so every path (greedy, sampled, split/merge verify) sees them without a kernel of its own to change.
++// A row whose history holds no match of `dry_allowed` tokens is untouched; dry_multiplier <= 0 launches nothing.
++void dry_apply(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
++               const SamplerParams& p, void* stream);
++
+ // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
+ //
+ // **`logits` AND `out` ARE DEVICE POINTERS.**  This is a CUDA kernel launch, not a host function, and nothing
+diff --git a/src/kernels/cuda/sampler.cu b/src/kernels/cuda/sampler.cu
+index b9e04318..e2527570 100644
+--- a/src/kernels/cuda/sampler.cu
++++ b/src/kernels/cuda/sampler.cu
+@@ -83,6 +83,52 @@ __device__ __forceinline__ double gumbel_exp(uint64_t seed, uint64_t counter, ui
+ // The repeat penalty MULTIPLIES for non-positive logits and DIVIDES for positive ones - dividing
+ // unconditionally is the natural reading of the source paper and it INVERTS the penalty on half the
+ // vocabulary.  The presence penalty is `float(count > 0)`, a boolean, not the count.
++// ---- DRY (llama.cpp's sampler): see SamplerParams.  One block per token row; thread 0 finds the repeated
++// sequences in that row's history and the tokens that FOLLOWED them, everyone else scatters the penalties onto
++// those tokens' logits.  Only the tokens after a match are touched (at most the window's length of them), so the
++// cost does not scale with the vocabulary.
++constexpr int kDryMaxEntries = 64;    // distinct penalised tokens per row kept
++constexpr int kDryMaxMatch = 32;      // longest repeated sequence examined
++
++__global__ void dry_apply_kernel(float* __restrict__ logits, int n_vocab,
++                                 const int* __restrict__ history, int history_len,
++                                 float mult, float base, int allowed, int dry_n) {
++    const int t = blockIdx.x;
++    float* l = logits + (size_t) t * n_vocab;
++    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
++    int hlen = 0;
++    if (hrow != nullptr) {
++        hlen = dry_n < history_len ? dry_n : history_len;
++        if (hlen < 0) hlen = 0;
++        hrow += history_len - hlen;                    // the window is the TAIL of the row
++    }
++    __shared__ int s_id[kDryMaxEntries];
++    __shared__ float s_pen[kDryMaxEntries];
++    __shared__ int s_n;
++    if (threadIdx.x == 0) {
++        s_n = 0;
++        for (int j = 0; j < hlen && s_n < kDryMaxEntries; ++j) {
++            const int v = hrow[j];
++            if (v < 0 || v >= n_vocab) continue;
++            // how far back does the sequence ENDING AT j-1 agree with the sequence ending at the history's end?
++            int L = 0;
++            while (L < j && L < kDryMaxMatch && hrow[j - 1 - L] == hrow[hlen - 1 - L]) ++L;
++            if (L < allowed) continue;
++            const float pen = mult * powf(base, (float) (L - allowed));
++            int k = 0;
++            for (; k < s_n; ++k)
++                if (s_id[k] == v) {                        // the same token after two different matches: keep the worse
++                    if (pen > s_pen[k]) s_pen[k] = pen;
++                    break;
++                }
++            if (k == s_n) { s_id[s_n] = v; s_pen[s_n] = pen; ++s_n; }
++        }
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < s_n; i += blockDim.x) l[s_id[i]] -= s_pen[i];
++}
++
++
+ __device__ __forceinline__ int history_count(const int* __restrict__ h, int n, int v) {
+     int c = 0;
+     for (int i = 0; i < n; ++i) if (h[i] == v) ++c;
+@@ -1187,6 +1233,16 @@ int2* split_scratch(void* stream, size_t entries) {
+ 
+ }  // namespace
+ 
++void dry_apply(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
++               const SamplerParams& p, void* stream) {
++    if (p.dry_multiplier <= 0.0f || logits == nullptr || n_tokens <= 0 || n_vocab <= 0) return;
++    if (history == nullptr || history_len <= 0 || p.dry_last_n <= 0) return;
++    const float base = p.dry_base > 1.0f ? p.dry_base : 1.75f;
++    const int allowed = p.dry_allowed < 0 ? 0 : p.dry_allowed;
++    dry_apply_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
++        logits, n_vocab, history, history_len, p.dry_multiplier, base, allowed, p.dry_last_n);
++}
++
+ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
+ #if defined(__HIPCC__)
+     (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
+@@ -1246,6 +1302,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+                      p.penalty_last_n, (const void*) history, history_len);
+         std::exit(1);
+     }
++    dry_apply(const_cast<float*>(logits), n_tokens, n_vocab, history, history_len, p, stream);   // DRY, before the pick
+     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
+                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
+                                : 0;
+@@ -1356,6 +1413,9 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
+         return false;
+     int2* scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
+     if (scratch == nullptr) return false;
++    // DRY here, not earlier: every `return false` above falls back to sample_tokens, which applies it itself - doing
++    // both would count the same penalty twice.
++    dry_apply(const_cast<float*>(logits), n_tokens, n_vocab, history, history_len, p, stream);
+     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
+                                 (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
+     spec_verify_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ccb153fa..50da9b70 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -669,6 +669,11 @@ struct Options {
+     std::string mtp_q4;   ///< "" (off), all, proj (the projections only) or head (the draft head only)
+     /// --mtp-draft-vocab FILE (opt-in): the draft head's token subset from FILE instead of <mtp>/draft_vocab.bin
+     std::string mtp_draft_vocab;
++    /// --mtp-cpu-moe (opt-in): the draft layer's routed experts live in host RAM and are computed by the CPU, freeing
++    /// their 312 MiB (256 experts) for the main model's expert cache - what a small card needs to run MTP at a long
++    /// context.  The draft's forward then skips its CUDA graphs (a host-side expert pass cannot be captured);
++    /// llama.cpp's PR #29620 measures +27% decode over MTP off for that mode.  0 = off (the default).
++    int mtp_cpu_moe = 0;
+     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
+     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
+     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
+@@ -813,6 +818,10 @@ void usage() {
+                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
+                  "  --mtp-q4 all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies\n"
+                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
++                 "  --mtp-cpu-moe      opt-in: the draft layer's routed experts on the CPU pool, freeing their",
++                 "                       312 MiB for the expert cache (what a small card needs for MTP at a long",
++                 "                       context).  The draft then skips its CUDA graphs.  llama.cpp PR #29620",
++                 "                       measures +27% decode over MTP off; drafts are verified, so accuracy holds.\n"
+                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
+                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
+                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
+@@ -2055,6 +2064,7 @@ int main(int argc, char** argv) {
+             }
+         }
+         else if (a == "--mtp-draft-vocab") o.mtp_draft_vocab = next("--mtp-draft-vocab");
++        else if (a == "--mtp-cpu-moe") o.mtp_cpu_moe = std::atoi(next("--mtp-cpu-moe")) > 0 ? 1 : 0;
+         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
+         else if (a == "--control-vector-scaled") {
+             // FILE:SCALE, comma-separated; the LAST colon splits, so a Windows path (C:\...) keeps its drive
+@@ -4493,6 +4503,7 @@ int main(int argc, char** argv) {
+         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
+         mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);   // --mtp-hnorm stream (opt-in), before any capture
+         mtp.set_q4(o.mtp_q4 == "all" || o.mtp_q4 == "proj", o.mtp_q4 == "all" || o.mtp_q4 == "head");   // before load
++        mtp.set_cpu_moe(o.mtp_cpu_moe);                                                                // before load
+         if (!o.mtp_draft_vocab.empty()) mtp.set_draft_vocab(o.mtp_draft_vocab);
+         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
+         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference

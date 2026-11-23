@@ -1,0 +1,283 @@
+From 59f51b66473ba64e9e52c243993fbd28da70372b Mon Sep 17 00:00:00 2001
+From: strata-4gb <strata-4gb@localhost>
+Date: Mon, 23 Nov 2026 11:25:55 +0800
+Subject: [PATCH 1/3] =?UTF-8?q?mtp:=20--mtp-cpu-moe=20=E2=80=94=20the=20dr?=
+ =?UTF-8?q?aft=20layer's=20256=20experts=20on=20the=20CPU=20(312=20MiB=20o?=
+ =?UTF-8?q?f=20VRAM=20freed)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The draft layer's routed experts move to host RAM and run on the CPU, which lets an
+81920-token context keep MTP drafting on a 4 GB card: the draft layer's VRAM drops
+from 439 to 127 MiB. The CPU path skips CUDA graph capture and splits
+capture_round/capture_step into run_round/run_step so the kernels can be launched
+directly.
+
+Measured (RTX 3050 Ti 4 GB, UD-IQ3_S): ctx 65536 decode 24.7 tok/s (87% drafts
+accepted), ctx 81920 decode 18.6-21.5 tok/s (88-89%).
+---
+ include/strata/core/mtp.hpp |  15 +++++
+ src/core/mtp.cpp            | 116 +++++++++++++++++++++++++++++++-----
+ 2 files changed, 115 insertions(+), 16 deletions(-)
+
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index db40d7a1..90d1f2e8 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -22,6 +22,7 @@
+ #include "strata/core/layer.hpp"
+ #include "strata/core/session.hpp"
+ #include "strata/kernels/sampler.hpp"
++#include "strata/kernels/cpu/native_expert.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -62,6 +63,10 @@ public:
+     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
+     /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
+     void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
++    /// --mtp-cpu-moe: the draft layer's routed experts on the CPU (0 = in VRAM, the default).
++    void set_cpu_moe(int n) { cpu_moe_ = n > 0; }
++    /// --mtp-cpu-moe: every routed expert of the draft layer, computed on the CPU into parts_.
++    void cpu_expert_rows(int T, int K, int64_t N);
+     /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
+     /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
+     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
+@@ -171,6 +176,9 @@ private:
+     bool capture_prefill(int T, std::string& err);
+     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+     bool capture_round(int T, bool coupled, std::string& err);
++    /// The draft round's / step's kernel sequence, run directly (no CUDA graph) under --mtp-cpu-moe.
++    bool run_round(int T, bool coupled, cudaStream_t cs, std::string& err);
++    bool run_step(int j, bool coupled, cudaStream_t cs, std::string& err);
+     bool capture_step(int j, bool coupled, std::string& err);
+     cudaGraphExec_t step_exec_[9] = {};
+     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
+@@ -245,6 +253,13 @@ private:
+     uint64_t xblob_ = 0;
+     uint8_t* nat_xq_ = nullptr;      ///< the routed experts' q8_1 input (native experts)
+     uint8_t* nat_scratch_ = nullptr;
++    /// --mtp-cpu-moe: the routed experts live in host RAM and the CPU computes them; the draft's forward then runs
++    /// without CUDA graphs (a host-side pass cannot be captured).
++    bool cpu_moe_ = false;
++    uint8_t* cpu_experts_ = nullptr;
++    strata::kernels::cpu::NativeFmt cpu_fmt_{};
++    bool cpu_fmt_ok_ = false;
++    int n_experts_ = 0;
+     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
+     bool owns_weights_ = true;
+     bool owns_draft_head_ = true;
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 23afb5d7..36007bea 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -152,6 +152,7 @@ MtpDrafter::~MtpDrafter() {
+     if (sh_join_) cudaEventDestroy(sh_join_);
+     if (owns_weights_ && dense_) cudaFree(dense_);
+     if (owns_weights_ && experts_) cudaFree(experts_);
++    if (owns_weights_ && cpu_experts_) std::free(cpu_experts_);
+     if (state_arena_) cudaFree(state_arena_);
+     if (arena_) cudaFree(arena_);
+     if (head_logits_) cudaFree(head_logits_);
+@@ -373,8 +374,21 @@ bool MtpDrafter::load_gguf_layer(const std::string& gguf, const ModelGeometry& g
+             err = "mtp: unexpected native expert layout";
+             return false;
+         }
++        // --mtp-cpu-moe: the experts stay in host RAM (the CPU computes every one) and their VRAM goes to the main
++        // model's expert cache.  Otherwise they are one device blob.
+         const uint64_t bytes = (uint64_t) g.n_expert * xblob_;
+-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) {
++        n_experts_ = (int) g.n_expert;
++        if (cpu_moe_) {
++            cpu_experts_ = (uint8_t*) std::malloc((size_t) bytes);
++            if (cpu_experts_ == nullptr) { err = "mtp: no host RAM for the draft layer's experts"; return false; }
++            strata::kernels::cpu::NativeFmt cf{};
++            if (!strata::kernels::cpu::native_fmt(xgu_, xd_, N, g.n_ff, cf, err)) return false;
++            cpu_fmt_ = cf;
++            cpu_fmt_ok_ = true;
++            std::fprintf(stderr, "strata mtp: --mtp-cpu-moe: the draft layer's %lld experts on the CPU (%.0f MiB of VRAM freed); "
++                                 "its forward runs without CUDA graphs\n",
++                         (long long) g.n_expert, (double) bytes / 1048576.0);
++        } else if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) {
+             err = "mtp: the draft layer's " + std::to_string(g.n_expert) + " experts do not fit in VRAM";
+             return false;
+         }
+@@ -383,9 +397,12 @@ bool MtpDrafter::load_gguf_layer(const std::string& gguf, const ModelGeometry& g
+             std::memcpy(blob.data(), sg + e * gu_bytes, gu_bytes);
+             std::memcpy(blob.data() + L.up_off, su + e * gu_bytes, gu_bytes);
+             std::memcpy(blob.data() + L.down_off, sd + e * d_bytes, d_bytes);
+-            cudaMemcpy(experts_ + e * xblob_, blob.data(), xblob_, cudaMemcpyHostToDevice);
++            if (cpu_moe_)
++                std::memcpy(cpu_experts_ + e * xblob_, blob.data(), xblob_);
++            else
++                cudaMemcpy(experts_ + e * xblob_, blob.data(), xblob_, cudaMemcpyHostToDevice);
+         }
+-        vram_ += bytes;
++        if (!cpu_moe_) vram_ += bytes;
+     } catch (const std::exception& ex) {
+         err = std::string("mtp: ") + gguf + ": " + ex.what();
+         return false;
+@@ -962,6 +979,38 @@ void MtpDrafter::norm_rope(float* data, const float* gamma, int rows, int cols,
+     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
+ }
+ 
++// --mtp-cpu-moe: the draft layer's routed experts, all of them on the CPU (ggml-cpu's own dots - the same bits the
++// engine's CPU expert pool produces).  Every (token, slot) is computed from host RAM; the result goes to parts_ [T][K][N].
++void MtpDrafter::cpu_expert_rows(int T, int K, int64_t N) {
++    if (!cpu_fmt_ok_ || cpu_experts_ == nullptr || mixed_ == nullptr || parts_ == nullptr) return;
++    const strata::kernels::cpu::NativeFmt& f = cpu_fmt_;
++    const int64_t ne = f.n_embd, nff = f.n_ff;
++    std::vector<float> hx((size_t) T * N);          // the token activations (mixed_ is device memory)
++    std::vector<int32_t> hid((size_t) T * K);       // the routed ids
++    if (cudaMemcpy(hx.data(), mixed_, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
++    if (cudaMemcpy(hid.data(), ids_, (size_t) T * K * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
++    std::vector<float> hp((size_t) T * K * N);      // parts_, filled here
++    std::vector<uint8_t> actq(f.act_bytes), hq(f.h_bytes);
++    std::vector<float> ff((size_t) nff), acc((size_t) ne);
++    for (int t = 0; t < T; ++t) {
++        strata::kernels::cpu::native_quant_act(f, hx.data() + (size_t) t * N, actq.data());
++        const void* ap = (const void*) actq.data();
++        for (int k = 0; k < K; ++k) {
++            const int32_t e = hid[(size_t) (t * K + k)];
++            if (e < 0 || e >= n_experts_) continue;         // out of range: zeros (never happens)
++            const uint8_t* blob = cpu_experts_ + (size_t) e * f.bytes;
++            float* ffp = ff.data();
++            strata::kernels::cpu::native_gu_rows(f, blob, &ap, 1, &ffp, 0, nff);
++            strata::kernels::cpu::native_quant_h(f, ff.data(), hq.data());
++            const void* hqp = (const void*) hq.data();
++            float* outp = acc.data();
++            strata::kernels::cpu::native_down_rows(f, blob, &hqp, 1, &outp, 0, ne);
++            std::memcpy(hp.data() + ((size_t) (t * K + k)) * N, acc.data(), (size_t) N * sizeof(float));
++        }
++    }
++    cudaMemcpyAsync(parts_, hp.data(), (size_t) T * K * N * sizeof(float), cudaMemcpyHostToDevice, cs_);
++}
++
+ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+     using namespace strata::kernels;
+     const ModelGeometry& g = *g_;
+@@ -1089,7 +1138,17 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+                 native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
+             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
+         }
+-        if (xblob_ > 0) {   // the model file's experts in their GGUF form
++        if (xblob_ > 0 && cpu_moe_) {
++            // --mtp-cpu-moe: the routed experts are in host RAM; the CPU computes every (token, slot) into parts_.
++            // This runs outside CUDA Graph capture (the launch path below skips the graphs in this mode), so the
++            // host round-trips are legal.
++            if (!cpu_fmt_ok_ || cpu_experts_ == nullptr) { err = "mtp: the CPU experts' layout was not set up"; return false; }
++            if (cudaStreamSynchronize(cs) != cudaSuccess) {
++                err = std::string("mtp: syncing before the CPU experts: ") + cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++            cpu_expert_rows(T, K, N);
++        } else if (xblob_ > 0) {   // the model file's experts in their GGUF form
+             moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) xblob_, grp_ptr_, grp_start_, grp_counts_,
+                                hit_dst_, hit_slot_, cs);
+             quantize_q8_1_rows(mixed_, T, N, nat_xq_, cs);
+@@ -1239,12 +1298,12 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
+     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+ }
+ 
+-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+-    if (exec) return true;
++// The draft round's kernel sequence: the inputs, then the layer's front and rest, then the selection.  It is captured
++// into a CUDA graph for the fast path and run directly (no capture) under --mtp-cpu-moe, where a host-side expert
++// pass cannot be captured.
++bool MtpDrafter::run_round(int T, bool coupled, cudaStream_t cs, std::string& err) {
+     using namespace strata::kernels;
+     const int64_t HCN = g_->hc * g_->n_embd;
+-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+     bool ok = true;
+     // coupled: the request's chain and the penalty history's base, for this round's drafts
+     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
+@@ -1280,18 +1339,25 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+     }
+     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
++    return ok;
++}
++
++bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
++    if (cpu_moe_) return true;   // --mtp-cpu-moe: no graph; the launch path calls run_round directly
++    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
++    if (exec) return true;
++    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
++    const bool ok = run_round(T, coupled, cs_, err);
+     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+ }
+ 
+ // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
+ // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
+-bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+-    if (exec) return true;
++// Chain step j's kernel sequence (see run_round).
++bool MtpDrafter::run_step(int j, bool coupled, cudaStream_t cs, std::string& err) {
+     using namespace strata::kernels;
+     const int64_t HCN = g_->hc * g_->n_embd;
+     const int row = max_t_ + j - 1;
+-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+ #if defined(STRATA_USE_HIP)
+     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
+     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
+@@ -1306,6 +1372,15 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+     coupled_rec_ = false;
+     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
++    return ok;
++}
++
++bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
++    if (cpu_moe_) return true;   // --mtp-cpu-moe: no graph (see capture_round)
++    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
++    if (exec) return true;
++    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
++    const bool ok = run_step(j, coupled, cs_, err);
+     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+ }
+ 
+@@ -1497,12 +1572,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+ 
+     int n = 0;
+     if (min_p <= 0.0f && max_steps > 0) {
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (cpu_moe_) {
++            // --mtp-cpu-moe: no graph; the round's kernels are submitted directly (the CPU expert pass is inside).
++            if (!run_round(T, cp, cs_, err)) return false;
++        } else if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+         for (int j = 1; j < max_steps; ++j) {
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (cpu_moe_) {
++                if (!run_step(j, cp, cs_, err)) return false;
++            } else if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
+@@ -1531,7 +1611,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         prefetch_ple(drafts[last]);
+         n = max_steps;
+     } else if (max_steps > 0) {
+-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
++        if (cpu_moe_) {
++            if (!run_round(T, cp, cs_, err)) return false;
++        } else if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+             return false;
+         }
+@@ -1552,7 +1634,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+         if (probs) probs[0] = pj;
+         n = 1;
+         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
++            if (cpu_moe_) {
++                if (!run_step(j, cp, cs_, err)) return false;
++            } else if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                 return false;
+             }
