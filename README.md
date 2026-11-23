@@ -209,10 +209,14 @@ no files.
 **C. Command line**
 
 ```powershell
+# the engine writes it (no Python, no numpy, no GPU)
+<install>\strata\engine-cuda12\strata.exe pack --gguf <your.gguf> --out <install>\packs\qwen36-UD-IQ3_S
+
+# only a file whose small projections are quantized falls back to the Python packer
 python tools\make_pack.py --gguf <your.gguf> --packs <install>\packs
 ```
-> The server runs the same `tools/make_pack.py`; you can also run it yourself (to pre-build,
-> or to keep packs on another drive).
+> The server does the same: it calls the engine's `pack` subcommand first and only falls back to
+> the Python packer; the tokenizer is added by the server.
 
 
 > **A different quant needs a different pack.** `native_experts.txt` records which GGUF file it

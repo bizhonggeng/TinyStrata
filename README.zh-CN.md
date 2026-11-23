@@ -199,9 +199,13 @@ copy strata-run.py           <install>\tools\
 **C. 命令行**
 
 ```powershell
+# 引擎自己写（不需要 Python / numpy / GPU）
+<install>\strata\engine-cuda12\strata.exe pack --gguf <你的.gguf> --out <install>\packs\qwen36-UD-IQ3_S
+
+# 需要反量化的文件（小投影是量化类型）才回退到 python 的打包器
 python tools\make_pack.py --gguf <你的.gguf> --packs <install>\packs
 ```
-> 服务端用的就是同一个 `tools/make_pack.py`；它也可以单独跑（比如想先预生成、或放到别的盘）。
+> 服务端也是这样：先调引擎的 `pack` 子命令，失败才回退到 python 打包器；tokenizer 由服务端补。
 
 
 > **换量化必须换 pack。** pack 的 `native_experts.txt` 里写明了它指向哪个 GGUF 文件；
