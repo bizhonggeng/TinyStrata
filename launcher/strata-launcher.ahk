@@ -1000,6 +1000,19 @@ TemplateToParams(path) {
     return ""
 }
 
+; 模板配置里是否已经有“真”的 vision.mmproj（忽略未展开的 %占位符%）
+TemplateHasMmproj() {
+    global BASE_CFG
+    if (BASE_CFG = "" || !FileExist(BASE_CFG))
+        return false
+    try {
+        s := FileRead(BASE_CFG, "UTF-8")
+        if (RegExMatch(s, '"mmproj"\s*:\s*"([^"]*)"', &m))
+            return (Trim(m[1]) != "" && !InStr(m[1], "%"))
+    }
+    return false
+}
+
 ; 模板配置里是否已经有一个“真”的 --native（不是空、也不是未展开的 %占位符%）
 ; 用来避免“用户没选 GGUF 但其实模板已经指定了”这种假警报。
 TemplateHasNative() {
@@ -1015,6 +1028,29 @@ TemplateHasNative() {
 }
 
 ; 选 GGUF（覆盖 --native；换模型文件时 pack 也要匹配，通常同时换模板）
+; 视觉下拉框的可用性：没有 mmproj（且模板里也没有）时置灰并强制 off，
+; 免得用户选了 cpu 却又被 Normalize 静静改回 off。
+UpdateVisionEnabled() {
+    global visD, sVisD, mmprojE, sMmprojE
+    have := false
+    if (IsObject(mmprojE) && Trim(mmprojE.Value) != "")
+        have := true
+    if (IsObject(sMmprojE) && Trim(sMmprojE.Value) != "")
+        have := true
+    if (!have && TemplateHasMmproj())
+        have := true
+    if IsObject(visD) {
+        visD.Enabled := have
+        if !have
+            visD.Text := "off"
+    }
+    if IsObject(sVisD) {
+        sVisD.Enabled := have
+        if !have
+            sVisD.Text := "off"
+    }
+}
+
 PickNative() {
     global nativeE, sNativeE
     ; 两个界面各有一份展示框：起始目录取其中已经选过的那个
@@ -1036,7 +1072,7 @@ PickNative() {
 
 ; 选 mmproj（覆盖 vision.mmproj）
 PickMmproj() {
-    global mmprojE, sMmprojE
+    global mmprojE, sMmprojE, visD, sVisD
     cur := ""
     if IsObject(sMmprojE) && Trim(sMmprojE.Value) != ""
         cur := Trim(sMmprojE.Value)
@@ -1050,6 +1086,12 @@ PickMmproj() {
         mmprojE.Value := f
     if IsObject(sMmprojE)
         sMmprojE.Value := f
+    ; 选了 mmproj 说明要用视觉：如果当前是 off，默认切成 cpu（用户之后仍可自己改回去）
+    if IsObject(visD) && DdlText(visD, "off") = "off"
+        visD.Text := "cpu"
+    if IsObject(sVisD) && DdlText(sVisD, "off") = "off"
+        sVisD.Text := "cpu"
+    UpdateVisionEnabled()
     Tip("mmproj: " . BaseName(f))
 }
 
@@ -1094,6 +1136,10 @@ Normalize(o) {
     n.spec := Prop(o, "spec", "")
     n.vision := Prop(o, "vision", "cpu")
     n.vision_tokens := Prop(o, "vision_tokens", "300")
+    ; 视觉默认值只跟「有没有 mmproj」走：没有 → off（不报错、也不白白起一个编码器）；
+    ; 有（自己选的或模板里写好的真路径）→ cpu（不占显存）。
+    if (n.mmproj = "" && !TemplateHasMmproj())
+        n.vision := "off"
     n.min_p := Prop(o, "min_p", "")
     n.presence_penalty := Prop(o, "presence_penalty", "")
     n.repetition_penalty := Prop(o, "repetition_penalty", "")
@@ -1847,6 +1893,7 @@ SetFields(o) {
     mmprojE.Value := Prop(o, "mmproj", "")
     visD.Text := InList(Prop(o, "vision", "cpu"), VISION_LIST, "cpu")
     vistokE.Value := String(Prop(o, "vision_tokens", "300"))
+    UpdateVisionEnabled()
     gInSetFields := false
     presD.Text := InList(o.preserve, YN_LIST, "on")
     hostE.Value := o.host
@@ -2109,7 +2156,7 @@ BuildGui() {
     mdlD.OnEvent("Change", (*) => LoadTemplate(mdlD.Text))
     g.AddButton("x270 y138 w58 h26", "GGUF…").OnEvent("Click", (*) => PickNative())
     g.AddButton("x332 y138 w62 h26", "mmproj…").OnEvent("Click", (*) => PickMmproj())
-    g.AddButton("x398 y138 w44 h26", "清空").OnEvent("Click", (*) => (nativeE.Value := "", mmprojE.Value := "", Tip("已清空 GGUF/mmproj 覆盖")))
+    g.AddButton("x398 y138 w44 h26", "清空").OnEvent("Click", (*) => (nativeE.Value := "", mmprojE.Value := "", UpdateVisionEnabled(), Tip("已清空 GGUF/mmproj 覆盖")))
     nativeE := g.AddEdit("x446 y138 w256 h24 ReadOnly", "")
     nativeE.SetFont("s8")
     mmprojE := g.AddEdit("x22 y164 w680 h20 ReadOnly", "")
@@ -2299,6 +2346,7 @@ SetSimpleFields(o) {
     sPresCB.Value := (o.preserve = "on")
     sVisD.Text := InList(Prop(o, "vision", "cpu"), VISION_LIST, "cpu")
     sVisTokE.Value := String(Prop(o, "vision_tokens", "300"))
+    UpdateVisionEnabled()
     sShortR.Value := (o.mode = "long" ? 0 : 1)
     sLongR.Value := (o.mode = "long" ? 1 : 0)
     UpdateSimpleDerived(o.port > 0 ? o.port : 1339)
@@ -2610,7 +2658,8 @@ RunDriverCheck(o, tag) {                ; 跑驱动 --check，返回退出码与
 }
 
 Selftest() {
-    global selfBuf, DEV, gUiMode, gParams, gIgnoreIni
+    global selfBuf, DEV, gUiMode, gParams, gIgnoreIni, BASE_CFG, EXE, PY, DRIVER, RESULTS
+    global GUARD_PY, ROOT, SERVER_PY, sVisD, sMmprojE, sNativeE, sVisNoop
     selfBuf := ""
     SelfSay("TinyStrata 启动器 v" . APP_VER . " 自检  " . FormatTime(A_Now, "yyyy-MM-dd HH:mm:ss") . "   AHK " . A_AhkVersion . "   ptr" . A_PtrSize)
 
@@ -2835,6 +2884,23 @@ Selftest() {
     p6 := FitPos(1700, 10, 2000, 400, wa)
     SelfCheck("比工作区还宽时钉在左边界", p6.x = 0, "x=" . p6.x)
 
+    SelfSay("`n--- 6d. 视觉默认值跟 mmproj 走 ---")
+    savedCfg := BASE_CFG
+    tmpCfg := A_Temp . "\strata-vision-test.json"
+    try FileDelete(tmpCfg)
+    FileAppend('{"args": ["--pack", "x"], "vision": {"mmproj": ""}}', tmpCfg, 'UTF-8')
+    BASE_CFG := tmpCfg
+    SelfCheck("模板没有 mmproj → vision 默认 off", Normalize({mmproj: ""}).vision = "off",
+        Normalize({mmproj: ""}).vision)
+    SelfCheck("模板没有 mmproj 时即使传 cpu 也被改成 off", Normalize({mmproj: "", vision: "cpu"}).vision = "off",
+        Normalize({mmproj: "", vision: "cpu"}).vision)
+    BASE_CFG := savedCfg
+    SelfCheck("有 mmproj 时保留 cpu（不强行改）", Normalize({mmproj: "C:\\m\\x.gguf", vision: "cpu"}).vision = "cpu",
+        Normalize({mmproj: "C:\\m\\x.gguf", vision: "cpu"}).vision)
+    SelfCheck("有 mmproj 但用户选 off → 尊重 off", Normalize({mmproj: "C:\\m\\x.gguf", vision: "off"}).vision = "off",
+        Normalize({mmproj: "C:\\m\\x.gguf", vision: "off"}).vision)
+    try FileDelete(tmpCfg)
+
     SelfSay("`n--- 7. 界面字段往返（建一个隐藏窗口，SetFields -> CollectFields -> 命令行） ---")
     try {
         hg := BuildGui()                      ; 只建不 Show：界面上不弹窗
@@ -2920,6 +2986,27 @@ Selftest() {
         gParams := lp
         SetSimpleFields(lp)
         c2 := SimpleCollect()
+        ; 界面层：没 mmproj 时「图片」下拉框置灰且显示 off；有了就恢复可用
+        ; （模板也得当作“没有 mmproj”，否则 TemplateHasMmproj 会把它算作有）
+        savedMm := sMmprojE.Value
+        savedCfg2 := BASE_CFG
+        tmpCfg2 := A_Temp . "\strata-vision-ui.json"
+        try FileDelete(tmpCfg2)
+        FileAppend('{"args": []}', tmpCfg2, 'UTF-8')
+        BASE_CFG := tmpCfg2
+        sMmprojE.Value := ""
+        UpdateVisionEnabled()
+        SelfCheck("没有 mmproj → 「图片」下拉框置灰且为 off",
+            (sVisD.Enabled = false) && (sVisD.Text = "off"),
+            "Enabled=" . sVisD.Enabled . " 值=" . sVisD.Text)
+        sMmprojE.Value := "C:\\m\\x.gguf"
+        UpdateVisionEnabled()
+        SelfCheck("有 mmproj → 「图片」下拉框可用", (sVisD.Enabled = true),
+            "Enabled=" . sVisD.Enabled . " 值=" . sVisD.Text)
+        sMmprojE.Value := savedMm
+        BASE_CFG := savedCfg2
+        try FileDelete(tmpCfg2)
+        UpdateVisionEnabled()
         SelfCheck("简洁模式：GGUF/mmproj 往返一致",
             (c2.native = lp.native) && (c2.mmproj = lp.mmproj),
             c2.native . " | " . c2.mmproj)
