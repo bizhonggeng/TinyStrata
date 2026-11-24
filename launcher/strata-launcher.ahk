@@ -1071,7 +1071,7 @@ MtpModeToParams(mode) {
     v := (mode = "long" ? MTP_LIST_LONG : MTP_LIST_SHORT)
     return {on: v[1], off: "off"}
 }
-global DRAFT_LIST := ["en", "cjk", "cyrillic", "fr"]
+global DRAFT_LIST := ["full", "cjk", "cyrillic", "fr", "en"]   ; full = 全集（默认；en 子集对代码/中文吃亏）
 global YN_LIST := ["on", "off"]
 global VISION_LIST := ["off", "cpu", "gpu"]   ; 图片编码器：off / cpu（不占显存）/ gpu（~1.2GB）
 
@@ -1083,7 +1083,7 @@ ModePreset(mode) {
     ; 干活上下文正好落在 65536（模型 64k 召回 ~70% 那一档），既不太差也不至于频繁 auto-compact
     if (mode = "long")
         return {mode: "long", ctx: 81920, kv: "k8v4", resident: 0, mtp: "on",
-                draft: "en", reserve: 64, port: 1339, cors: "*", thinking: "on", preserve: "on",
+                draft: "full", reserve: 64, port: 1339, cors: "*", thinking: "on", preserve: "on",
                 mtp_cpu_moe: "on", spec: "2", mtp_mode: "cpu", chat_template: "", dry: "1.5",
                 tag: "long", host: "", apikey: "",
                 temperature: "0.6", top_p: "0.95", top_k: "20",
@@ -1092,7 +1092,7 @@ ModePreset(mode) {
         native: "", mmproj: "",
                 title: "Strata LONG - Qwen3.6-35B-A3B UD-IQ3_S (81920 KV / 64K working, all-resident, no MTP)"}
     return {mode: "short", ctx: 20480, kv: "k8v4", resident: 0, mtp: "on",
-            draft: "en", reserve: 64, port: 1339, cors: "*", thinking: "on", preserve: "on",
+            draft: "full", reserve: 64, port: 1339, cors: "*", thinking: "on", preserve: "on",
             mtp_cpu_moe: "off", spec: "3", mtp_mode: "gpu", chat_template: "", dry: "1.5",
             tag: "", host: "", apikey: "",
             temperature: "0.6", top_p: "0.95", top_k: "20",
@@ -1465,7 +1465,7 @@ Normalize(o) {
     n.kv := Prop(o, "kv", "k8v4")
     n.resident := Prop(o, "resident", 0)
     n.mtp := Prop(o, "mtp", "on")
-    n.draft := Prop(o, "draft", "en")
+    n.draft := Prop(o, "draft", "full")
     n.reserve := Prop(o, "reserve", 256)
     n.port := Prop(o, "port", 1339)
     n.cors := Prop(o, "cors", "*")
@@ -2259,7 +2259,7 @@ SetFields(o) {
     if (o.mode = "long" && want = "gpu")
         want := "cpu"
     mtpD.Text := want
-    draftD.Text := InList(o.draft, DRAFT_LIST, "en")
+    draftD.Text := InList(o.draft, DRAFT_LIST, "full")
     resvE.Value := String(o.reserve)
     portE.Value := String(o.port)
     corsE.Value := o.cors
@@ -2319,6 +2319,19 @@ ApplyPreset(mode) {
 }
 
 ; 上次启动时服务端算出的容量估算（results/capacity.json）；模型或 kv 对不上就返回 ""
+; 最近一次请求的草稿接受率（引擎日志里 "drafts accepted N of M"）；没有就返回 ""
+DraftAcceptText(mode) {
+    t := TailOf(EngineLogFor(mode), 20000)
+    if (t.text = "")
+        return ""
+    best := ""
+    for m in [t.text]
+        if RegExMatch(m, "drafts accepted (\d+) of (\d+)", &mm, -1)
+            if (mm[2] > 0)
+                best := Round(mm[1] * 100 / mm[2]) . "%  (" . mm[1] . "/" . mm[2] . ")"
+    return best
+}
+
 CapacityText(native, kv) {
     global RESULTS
     f := RESULTS . "\capacity.json"
@@ -2468,9 +2481,10 @@ RefreshStatus() {
         gMonitorOn := mon
         MakeLinks(st.port)
     }
+    acc := (st.state = "running" || st.state = "loading") ? DraftAcceptText(o.mode) : ""
     st3.Text := Tf("端口 ") . st.port . " · /props " . (st.http.ok ? "HTTP " . st.http.status : Tf("无响应"))
         . (st.mode != "" ? " · " . (st.mode = "long" ? Tf("长") : Tf("短")) . Tf("模式") : "") . extra
-        . Tf(" · 监控 ") . (mon ? Tf("开") : Tf("关"))
+        . Tf(" · 监控 ") . (mon ? Tf("开") : Tf("关")) . (acc != "" ? " · 草稿接受 " . acc : "")
     c := (st.ram.free >= 0 && st.ram.free < RAM_ABORT_MB) ? "cC00000"
        : (st.ram.free >= 0 && st.ram.free < MODEL_NEED_MB ? "cB8860B" : "c006400")
     st4.SetFont("s8 " . c)
@@ -3089,9 +3103,9 @@ Selftest() {
     ; 视觉默认值由 Normalize 决定（模板里有真 mmproj 才是 cpu，否则 off）：
     ; 期望串里的 vision 跟着它走，否则换个模板（比如便携包里的占位符）自检就假红
     expVis := Normalize(BatObjects().short).vision
-    expShort := '--ctx "20480" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --spec "3" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
+    expShort := '--ctx "20480" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "full" --spec "3" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
 
-    expLong  := '--ctx "81920" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "en" --mtp-cpu-moe "1" --spec "2" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --tag "long" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
+    expLong  := '--ctx "81920" --kv "k8v4" --vram-reserve-mib "64" --port "1339" --cors "*" --draft-vocab "full" --mtp-cpu-moe "1" --spec "2" --thinking "on" --preserve-thinking "on" --temperature "0.6" --top-p "0.95" --top-k "20" --dry-multiplier "1.5" --tag "long" --base "strata-qwen36-iq3s.json" --vision "' . expVis . '" --vision-tokens "300"'
 
     sLine := ArgsToStr(BuildArgs(ModePreset("short"), false))
     lLine := ArgsToStr(BuildArgs(ModePreset("long"), false))

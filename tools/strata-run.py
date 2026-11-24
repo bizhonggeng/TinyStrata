@@ -84,7 +84,8 @@ MEASURED_STREAM = {
     ("k8v4", 0, "off"): (81920, 90112),        # 全常驻 KV + MTP off（reserve 64）：长模式现在用的就是这个
 }
 KV_CHOICES = ["k8v4", "q4_0", "int8", "fp16"]
-DRAFT = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin",
+DRAFT = {"full": "draft_vocab.bin",          # 全集：任何内容都不吃亏（推荐）
+         "cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin",
          "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin"}
 
 
@@ -130,7 +131,8 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--vram-reserve-mib", type=int, default=256, help="引擎给别的程序留的显存（默认 700，小卡上会拒绝启动）")
     ap.add_argument("--port", type=int, default=1339)
     ap.add_argument("--cors", default="*", help="'*' = 任意网页；逗号分隔的具体源；空串 = 关闭 CORS")
-    ap.add_argument("--draft-vocab", default="en", choices=list(DRAFT), help="MTP 草稿头的 token 子集")
+    ap.add_argument("--draft-vocab", default="full", choices=list(DRAFT),
+                    help="MTP 草稿头的 token 子集：full=全集（默认，最稳）/ en / cjk / cyrillic / fr")
     ap.add_argument("--host", default=None, help="bench 在别的机器上时给 0.0.0.0")
     ap.add_argument("--api-key", default=None, help="设了 key 后 Host/Origin 2道门都关掉，客户端要带 Authorization")
     ap.add_argument("--vision-tokens", type=int, default=None,
