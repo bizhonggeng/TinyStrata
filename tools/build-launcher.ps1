@@ -57,7 +57,10 @@ if ($Icon -and (Test-Path $Icon)) {
 } else {
     Write-Host "[!!] 没找到 assets\icon.ico，用默认图标" -ForegroundColor Yellow
 }
-& $Compiler /in $In /out $Out /base $Base /compress 2 @extra | Out-Null
+# /compress 0 = 不压缩。Ahk2Exe 的 /compress 会用 UPX 打包（PE 里会出现 UPX0/UPX1 段），
+# 而 UPX 加壳的 exe 是 Windows Defender 的经典误报源（用户实测被判定为病毒）。
+# 代价只是体积（约 +0.6 MB），换来的是不再加壳、不再误报。
+& $Compiler /in $In /out $Out /base $Base /compress 0 @extra | Out-Null
 if (-not (Test-Path $Out)) { Write-Host "[XX] 编译失败" -ForegroundColor Red; exit 1 }
 $f = Get-Item $Out
 $h = (Get-FileHash $Out -Algorithm SHA256).Hash.ToLower()

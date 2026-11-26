@@ -1,0 +1,1593 @@
+Subject: [PATCH 0010/0010] serve: ctl - the middle layer the launcher asks for
+
+The launcher does not compute anything: parameters, the VRAM ceiling and the
+suggested ctx, preflight warnings and the runtime numbers all come from
+`python strata-ctl.py <plan|observe>` -- the new package `strata/ctl`, with
+`strata-ctl.py` at the bundle root as the entry point (an embedded CPython with
+python311._pth cannot use `-m strata.ctl`).
+
+Also in this patch:
+- serve/prepare.py: `--kv-resident 0` means "all KV in VRAM" (the engine's
+  default).  The old test treated 0 as streaming, so its log line and its
+  RAM-bound ceiling were wrong.
+
+Adds: ctl/params.py (mtp_mode -> mtp/mtp_cpu_moe/spec), ctl/fit.py (capacity
+files, ceiling/suggestion, measured slots), ctl/observe.py (log -> slots,
+drafts, tok/s, n_ctx), ctl/preflight.py (warnings as codes with priority),
+ctl/env.py (CUDA DLLs, sm_86), ctl/tests/ (48 unit tests).
+
+diff --git a/__init__.py b/__init__.py
+new file mode 100644
+index 00000000..494265ca
+--- /dev/null
++++ b/__init__.py
+@@ -0,0 +1 @@
++"""Strata 本地构建（含 serve/ 服务层、tools/、src/；ctl/ 是中间层）。"""
+diff --git a/ctl/__init__.py b/ctl/__init__.py
+new file mode 100644
+index 00000000..ed6b5b1c
+--- /dev/null
++++ b/ctl/__init__.py
+@@ -0,0 +1,2 @@
++"""strata/ctl —— 界面与引擎之间的中间层（唯一真相源）。"""
++__all__ = ["params"]
+diff --git a/ctl/__main__.py b/ctl/__main__.py
+new file mode 100644
+index 00000000..cf799056
+--- /dev/null
++++ b/ctl/__main__.py
+@@ -0,0 +1,263 @@
++"""`python -m strata.ctl` —— 给界面（AHK）/脚本用的适配器。
++
++两个子命令：
++
++    python -m strata.ctl plan    --ini-in in.ini --ini-out state.ini [--json state.json]
++                                 [--results DIR] [--native PATH] [--lang zh|en]
++    python -m strata.ctl observe --ini-out state.ini [--engine-log F] [--server-log F] [--run-config F]
++
++`plan` 的输出（state.ini）：
++
++    [meta]      schema_version / seq
++    [params]    原样带回（界面据此回显）
++    [resolved]  mtp / mtp_cpu_moe / spec / kv / kv_resident / slug     ← 唯一真相源
++    [flags]     MTP 三段的命令行片段
++    [bounds]    边界与建议值（来自 capacity；没有数据就 measured=false）
++    [warn.N]    预检提醒（code / hard / p_*）
++    [errors.N]  读入失败等（界面永远有东西可渲染）
++
++退出码：0 正常；2 入参文件不可读。
++"""
++
++from __future__ import annotations
++
++import argparse
++import configparser
++import json
++import sys
++import time
++from pathlib import Path
++
++from . import fit as F
++from . import observe as O
++from . import params as P
++from . import env as E
++from . import preflight as PF
++
++SCHEMA_VERSION = 1
++FACT_KEYS = ("engine_pid", "serve_pid", "guard_pid", "budget_mib", "ceiling", "suggested",
++             "ram_free_mb", "ram_total_mb", "model_path", "pack_problem", "slot_mib", "kvpt")
++
++
++def _read_ini(path: Path) -> tuple[dict, configparser.ConfigParser]:
++    cp = configparser.ConfigParser(interpolation=None)
++    cp.read(path, encoding="utf-8-sig")
++    params: dict = {}
++    if cp.has_section("params"):
++        params = {k: v for k, v in cp.items("params")}
++    else:
++        params = {k: v for k, v in cp.defaults().items()}
++    return params, cp
++
++
++def _write_ini(path: Path, lines: list[str]) -> None:
++    """原子写（.tmp + replace），CRLF —— AHK 的 IniRead 两种换行都认，但保持一致。"""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    tmp.write_text("".join(l + "\r\n" for l in lines), encoding="utf-8")
++    tmp.replace(path)
++
++
++def _facts(cp: configparser.ConfigParser) -> dict:
++    out: dict = {}
++    if not cp.has_section("facts"):
++        return out
++    for k, v in cp.items("facts"):
++        if k not in FACT_KEYS:
++            continue
++        if k.endswith(("_pid", "_mib", "_mb", "_mib_token")) or k == "kvpt":
++            try:
++                out[k] = float(v) if k == "kvpt" else int(v)
++            except ValueError:
++                out[k] = v
++        else:
++            out[k] = v
++    return out
++
++
++def plan(ini_in: Path, ini_out: Path, json_out: Path | None,
++         results: Path | None = None, native: str = "", lang: str = "zh",
++         lib_dirs: str = "", check_env: bool = False) -> int:
++    errors: list[tuple[str, dict]] = []
++    try:
++        if not ini_in.exists():
++            raise FileNotFoundError(f"入参文件不存在: {ini_in}")
++        raw, cp = _read_ini(ini_in)
++    except Exception as exc:                      # noqa: BLE001 - 读失败也要能渲染
++        raw, cp = {}, configparser.ConfigParser()
++        errors.append(("params.unreadable", {"detail": str(exc)[:120]}))
++
++    r = P.normalize(raw)
++    flags = P.engine_flags(r)
++    slug = P.capacity_slug_suffix(r)
++    seq = int(time.time() * 1000) % 2_000_000_000
++
++    # 边界/建议值：只读服务层写下的 capacity，没有就明说"还没数据"
++    native = native or str(raw.get("native") or "")
++    if results is not None and native:
++        bnd = F.boundary(results, native, r["kv"], r["mtp"], r["mtp_cpu_moe"])
++        ci = F.capacity_info(results, native, r["kv"], slug) if bnd["measured"] else None
++    else:
++        bnd = {"ok": 0, "rec": 0, "key": "", "measured": False}
++        ci = None
++
++    # 预检提醒：facts 由界面查好后一起传进来（这里不做系统探测）
++    # 数字区间校验（纯逻辑，不需要系统信息）
++    for e in E.validate({"ctx": raw.get("ctx"), "port": raw.get("port"),
++                         "vram_reserve_mib": raw.get("reserve"),
++                         "kv_resident": raw.get("kv_resident")}):
++        errors.append((e["code"], e.get("params") or {}))
++    facts = _facts(cp)
++    # 实测点由中间层自己从 capacity 读（界面只传 ctx / 模型 / 模式，不传数字）
++    if ci:
++        facts.setdefault("budget_mib", ci["budget"])
++        if ci.get("verified"):
++            facts.setdefault("seen_ctx", ci["measured_ctx"])
++            facts.setdefault("seen_slots", ci["measured_slots"])
++    warns = PF.warnings({**r, "ctx": raw.get("ctx", r["ctx"])}, facts)
++    if check_env:
++        for e in E.check_env([d for d in lib_dirs.split(";") if d]):
++            (errors if e["hard"] else warns).append(
++                (e["code"], e.get("params") or {}) if e["hard"] else e)
++
++    lines = [
++        "[meta]",
++        f"schema_version={SCHEMA_VERSION}",
++        f"seq={seq}",
++        "generated_at=" + time.strftime("%Y-%m-%dT%H:%M:%S"),
++        "",
++        "[params]",
++    ]
++    for k, v in r.items():
++        lines.append(f"{k}={v}")
++    lines += [
++        "",
++        "[resolved]",
++        f"mtp={r['mtp']}",
++        f"mtp_cpu_moe={r['mtp_cpu_moe']}",
++        f"spec={r['spec']}",
++        f"kv={r['kv']}",
++        f"kv_resident={r['kv_resident']}",
++        f"slug={slug}",
++        "source=estimated",
++        "",
++        "[flags]",
++        f"mtp={' '.join(flags)}",
++        f"slug={slug}",
++        "",
++        "[bounds]",
++        f"measured={'true' if bnd['measured'] else 'false'}",
++        f"ceiling={bnd['ok']}",
++        f"suggested={bnd['rec']}",
++        f"suggested_source={'measured' if bnd['measured'] and bnd['rec'] > 0 else 'none'}",
++        f"ceiling_source={'measured' if bnd['measured'] else 'none'}",
++        f"kvpt={bnd.get('kvpt', 0)}",
++        f"slot_mib={bnd.get('slot_mib', 0)}",
++        f"measured_ctx={bnd.get('measured_ctx', 0)}",
++        f"measured_slots={bnd.get('measured_slots', 0)}",
++        f"capacity_label={F.label(ci, lang) if ci else ''}",
++        f"basis={ci['basis'] if ci else ''}",
++        f"budget={ci['budget'] if ci else 0}",
++        f"ceiling_measured={ci['ceiling'] if ci else 0}",
++        f"measured_verified={'true' if ci and ci.get('verified') else 'false'}",
++    ]
++    for i, w in enumerate(warns, 1):
++        if isinstance(w, tuple):
++            w = {"code": w[0], "params": w[1], "hard": True, "priority": 5}
++        lines += ["", f"[warn.{i}]", f"code={w['code']}",
++                  f"hard={'true' if w['hard'] else 'false'}", f"priority={w.get('priority', 999)}"]
++        for k, v in (w.get("params") or {}).items():
++            lines.append(f"p_{k}={v}")
++    # 弹窗只要"有几条、几条阻塞、最要紧的是哪几条"—— 顺序由中间层给，界面别自己排
++    sm = PF.summary(warns)
++    lines += ["", "[dialog]", f"count={sm['count']}", f"hard={sm['hard_count']}"]
++    for k in range(3):
++        lines.append(f"top{k + 1}=" + (sm["top"][k] if k < len(sm["top"]) else ""))
++    for i, (code, p) in enumerate(errors, 1):
++        lines += ["", f"[errors.{i}]", f"code={code}"]
++        for k, v in p.items():
++            lines.append(f"{k}={v}")
++
++    _write_ini(ini_out, lines)
++
++    if json_out is not None:
++        payload = {
++            "schema_version": SCHEMA_VERSION,
++            "seq": seq,
++            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
++            "params": r,
++            "resolved": {"mtp": r["mtp"], "mtp_cpu_moe": r["mtp_cpu_moe"], "spec": r["spec"],
++                         "slug": slug, "source": "estimated"},
++            "engine_flags": flags,
++            "bounds": {"ceiling": bnd["ok"], "suggested": bnd["rec"], "measured": bnd["measured"],
++                       "key": bnd["key"], "kvpt": bnd.get("kvpt", 0),
++                       "slot_mib": bnd.get("slot_mib", 0),
++                       "capacity_label": F.label(ci, lang) if ci else ""},
++            "warnings": warns,
++            "errors": [{"code": c, **p} for c, p in errors],
++        }
++        jtmp = json_out.with_suffix(json_out.suffix + ".tmp")
++        jtmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
++        jtmp.replace(json_out)
++
++    return 0 if not errors else 2
++
++
++def observe(ini_out: Path, engine_log: Path | None, server_log: Path | None,
++            run_config: Path | None) -> int:
++    """把一次刷新的运行时数字写进 state.ini 的 [runtime]。"""
++
++    def tail(path: Path | None, limit: int = 60000) -> str:
++        if path is None:
++            return ""
++        try:
++            return path.read_bytes()[-limit:].decode("utf-8", "replace")
++        except OSError:
++            return ""
++
++    snap = O.snapshot(tail(engine_log), tail(server_log), tail(run_config, 20000))
++    lines = ["[runtime]"]
++    for k, v in snap.items():
++        lines.append(f"{k}={'true' if v else 'false'}" if isinstance(v, bool) else f"{k}={v}")
++    lines += ["", "[meta]", f"schema_version={SCHEMA_VERSION}",
++              "seq=" + str(int(time.time() * 1000) % 2_000_000_000)]
++    _write_ini(ini_out, lines)
++    return 0
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(prog="strata.ctl")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    p_plan = sub.add_parser("plan", help="归一化参数、读边界、算预检提醒，写出 state.ini")
++    p_plan.add_argument("--ini-in", required=True)
++    p_plan.add_argument("--ini-out", required=True)
++    p_plan.add_argument("--json", default=None)
++    p_plan.add_argument("--results", default=None, help="results 目录（含 capacity/）")
++    p_plan.add_argument("--native", default="", help="模型路径（缺省读 [params] native）")
++    p_plan.add_argument("--lang", default="zh", choices=["zh", "en"])
++    p_plan.add_argument("--lib-dirs", default="", help="CUDA 运行库目录（; 分隔），用于环境检查")
++    p_plan.add_argument("--env", action="store_true", help="同时做运行环境检查（CUDA DLL / sm 架构）")
++
++    p_obs = sub.add_parser("observe", help="解析日志并把运行时数字写进 state.ini")
++    p_obs.add_argument("--ini-out", required=True)
++    p_obs.add_argument("--engine-log", default=None)
++    p_obs.add_argument("--server-log", default=None)
++    p_obs.add_argument("--run-config", default=None)
++
++    a = ap.parse_args(argv)
++    if a.cmd == "plan":
++        return plan(Path(a.ini_in), Path(a.ini_out),
++                    Path(a.json) if a.json else None,
++                    Path(a.results) if a.results else None, a.native, a.lang,
++                    a.lib_dirs, a.env)
++    if a.cmd == "observe":
++        return observe(Path(a.ini_out),
++                       Path(a.engine_log) if a.engine_log else None,
++                       Path(a.server_log) if a.server_log else None,
++                       Path(a.run_config) if a.run_config else None)
++    return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/ctl/env.py b/ctl/env.py
+new file mode 100644
+index 00000000..221d17f4
+--- /dev/null
++++ b/ctl/env.py
+@@ -0,0 +1,109 @@
++"""参数校验与环境检查（R9）：判断逻辑都在这里，界面只做文案。
++
++两块内容：
++
++1. `validate(params)` —— 纯区间校验（ctx / port / reserve / kv-resident），不需要任何系统信息。
++2. `check_env(lib_dirs)` —— 运行环境：CUDA 运行库在不在、显卡架构是否与本引擎的 sm_86 匹配。
++
++输出统一是 `[{code, params, hard}]`，界面用 code → 本地化文案。
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++CUDA_DLLS = ("cudart64_12.dll", "cublas64_12.dll")
++BUILT_ARCH = "8.6"          # 本 Release 的引擎按 sm_86 编译
++
++
++def validate(params: dict) -> list[dict]:
++    """数字参数的区间校验（值为空的项跳过，留给调用方的默认值）。"""
++    out: list[dict] = []
++
++    def as_int(v):
++        try:
++            return int(str(v).strip())
++        except (TypeError, ValueError):
++            return None
++
++    ctx = as_int(params.get("ctx"))
++    if params.get("ctx") not in (None, "") and (ctx is None or ctx <= 0):
++        out.append({"code": "ctx.invalid", "params": {"value": params.get("ctx")}, "hard": True})
++
++    port = as_int(params.get("port"))
++    if port is not None and not (1 <= port <= 65535):
++        out.append({"code": "port.invalid", "params": {"value": port}, "hard": True})
++
++    reserve = as_int(params.get("vram_reserve_mib"))
++    if reserve is not None and reserve < 0:
++        out.append({"code": "reserve.invalid", "params": {"value": reserve}, "hard": True})
++
++    resident = as_int(params.get("kv_resident"))
++    if resident is not None and resident != 0 and resident < 20480:
++        # 引擎只接受 0（全部 KV 驻显存）或 >= 20480（流式窗口下限）
++        out.append({"code": "resident.invalid", "params": {"value": resident}, "hard": True})
++    return out
++
++
++def _find_dll(name: str, lib_dirs: list[str]) -> str:
++    """在 lib_dirs 和 PATH 里找一个 DLL。
++
++    不能用 `shutil.which`：Windows 上它按"可执行文件"判定，`.dll` 会返回 None，
++    于是 PATH 里明明有 cudart64_12.dll 也被判成缺失（踩过，弹窗里出现了 env.cudart.missing）。
++    """
++    for d in lib_dirs:
++        if not d:
++            continue
++        p = Path(d) / name
++        if p.is_file():
++            return str(p)
++    for d in os.environ.get("PATH", "").split(os.pathsep):
++        if not d:
++            continue
++        p = Path(d) / name
++        try:
++            if p.is_file():
++                return str(p)
++        except OSError:
++            continue
++    return ""
++
++
++def compute_cap() -> str:
++    """显卡的 compute capability（"8.6" 这种），查不到就返回空串。"""
++    exe = shutil.which("nvidia-smi")
++    if not exe:
++        return ""
++    try:
++        r = subprocess.run([exe, "--query-gpu=compute_cap", "--format=csv,noheader"],
++                           capture_output=True, text=True, timeout=8)
++    except (OSError, subprocess.SubprocessError):
++        return ""
++    line = (r.stdout or "").strip().splitlines()
++    return line[0].strip() if line and r.returncode == 0 else ""
++
++
++def arch_flag(cap: str) -> str:
++    """"8.9" -> "-arch=sm_89"（给"自己编译"提示用）。"""
++    digits = "".join(ch for ch in (cap or "") if ch.isdigit())
++    return f"-arch=sm_{digits}" if digits else "-arch=sm_86"
++
++
++def check_env(lib_dirs: list[str] | None = None, cap: str | None = None) -> list[dict]:
++    """运行环境检查。全部按"提醒"处理：DLL 也可能由驱动从配置的 lib_dirs 注入，
++    界面的 EnvProblems() 才是硬判据（那是本机事实查询，留在界面）。"""
++    lib_dirs = list(lib_dirs or [])
++    out: list[dict] = []
++    for name, code in (("cudart64_12.dll", "env.cudart.missing"),
++                       ("cublas64_12.dll", "env.cublas.missing")):
++        if not _find_dll(name, lib_dirs):
++            out.append({"code": code, "params": {"dll": name}, "hard": False})
++    cap = compute_cap() if cap is None else cap
++    if cap and cap != BUILT_ARCH:
++        out.append({"code": "env.sm.mismatch",
++                    "params": {"cap": cap, "built": BUILT_ARCH, "flag": arch_flag(cap)},
++                    "hard": False})
++    return out
+diff --git a/ctl/fit.py b/ctl/fit.py
+new file mode 100644
+index 00000000..ede04457
+--- /dev/null
++++ b/ctl/fit.py
+@@ -0,0 +1,131 @@
++"""边界与建议值（P2）：容量文件的唯一读取口。
++
++数据来源是服务层 `serve/prepare.py` 在**引擎加载前**写下的
++`<results>/capacity/<模型>-<kv>-<mtpgpu|mtpcpu|nomtp>.json`。
++
++口径约定（与 prepare 一致，别再自己推）：
++- `ctx_estimate`      服务端按模型元数据 + 剩余显存/内存算的上限（"能启动"的上限）
++- `ctx_suggested`     保留足够专家槽（默认 400 槽）的建议 ctx
++- `ctx_estimate_basis` `vram`（整窗常驻显存）或 `ram`（KV 流式，内存先撞）
++- `expert_slot_mib`   一个专家槽占多少 MiB（量化相关）
++- `kv_measured_mib_per_token`  上次实测的 K/V 每 token 成本（有则优先用）
++
++"能启动 ≠ 能用"：上限再高，槽位被挤光时解码只有几 tok/s，所以建议值按槽位算。
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from pathlib import Path
++
++SAFE = re.compile(r"[^A-Za-z0-9._-]+")
++
++
++def mtp_slug(mtp: str, cpu_moe: str) -> str:
++    if mtp == "off":
++        return "nomtp"
++    return "mtpcpu" if cpu_moe in ("on", "1", "true") else "mtpgpu"
++
++
++def capacity_slug(native: str, kv: str, slug: str) -> str:
++    name = Path(native).name if native else ""
++    return SAFE.sub("_", name) + "-" + SAFE.sub("_", kv) + "-" + slug
++
++
++def capacity_file(results: Path | str, native: str, kv: str, slug: str) -> Path:
++    return Path(results) / "capacity" / (capacity_slug(native, kv, slug) + ".json")
++
++
++def capacity_info(results: Path | str, native: str, kv: str, slug: str) -> dict | None:
++    """读一份 capacity；文件不存在或内容不匹配就返回 None（界面据此说"还没有数据"）。"""
++    f = capacity_file(results, native, kv, slug)
++    try:
++        raw = f.read_text(encoding="utf-8-sig")
++    except OSError:
++        return None
++    try:
++        d = json.loads(raw)
++    except ValueError:
++        return None
++    if str(d.get("model", "")).lower() != Path(native).name.lower():
++        return None
++    if d.get("kv") != kv:
++        return None
++    # 文件名已经带模式；文件里的 mtp_cpu_moe 只做一次兜底校验（nomtp 没有这个键）
++    if slug != "nomtp" and "mtp_cpu_moe" in d:
++        if bool(d["mtp_cpu_moe"]) != (slug == "mtpcpu"):
++            return None
++    mib = d.get("ctx_estimate")
++    if not isinstance(mib, int) or mib <= 0:
++        return None
++    return {
++        "ctx": mib,
++        "basis": d.get("ctx_estimate_basis", "vram"),
++        "suggest": int(d.get("ctx_suggested") or 0),
++        "budget": int(d.get("vram_budget_mib") or 0),
++        "slot_mib": float(d.get("expert_slot_mib") or 0.0),
++        "kvpt": float(d.get("kv_measured_mib_per_token") or 0.0),
++        "ceiling": int(d.get("ctx_ceiling_measured") or 0),
++        "measured_ctx": int(d.get("measured_ctx") or 0),
++        "measured_slots": int(d.get("measured_slots") or 0),
++        # 只有启动器核过"日志确实属于这次启动"才会写 true（见 RecordMeasuredKvpt）
++        "verified": bool(d.get("measured_verified")),
++    }
++
++
++def boundary(results: Path | str, native: str, kv: str, mtp: str, cpu_moe: str) -> dict:
++    """上限（能启动）与建议（保留专家槽）。没有实测数据时 measured=False。"""
++    key = f"{kv}/{mtp}" + ("/cpumoe" if cpu_moe in ("on", "1") else "")
++    ci = capacity_info(results, native, kv, mtp_slug(mtp, cpu_moe)) if native else None
++    if not ci:
++        return {"ok": 0, "rec": 0, "key": key, "measured": False}
++    return {
++        "ok": ci["ctx"],
++        "rec": ci["suggest"] if ci["suggest"] > 0 else ci["ctx"],
++        "key": key,
++        "measured": True,
++        "basis": ci["basis"],
++        "kvpt": ci["kvpt"],
++        "slot_mib": ci["slot_mib"],
++        "measured_ctx": ci["measured_ctx"],
++        "measured_slots": ci["measured_slots"],
++    }
++
++
++def kvpt_for(ci: dict) -> float:
++    """每 token 在显存里占多少 MiB 的 K/V。
++
++    优先用实测（`kv_measured_mib_per_token`，由启动器从引擎日志反推写回）；
++    没有实测就返回 0 —— 宁可不给数字，也不套别的量化测出来的斜率。
++    """
++    return float(ci.get("kvpt") or 0.0)
++
++
++def slots_at(ci: dict, ctx: int) -> int:
++    """这个 ctx 下还能剩多少专家槽（0 = 算不出来，调用方不要说数字）。"""
++    kvpt = kvpt_for(ci)
++    slot = float(ci.get("slot_mib") or 0.0)
++    budget = int(ci.get("budget") or 0)
++    if kvpt <= 0 or slot <= 0 or budget <= 0:
++        return 0
++    left = budget - ctx * kvpt
++    return max(0, int(left / slot))
++
++
++def ctx_for_slots(ci: dict, slots: int) -> int:
++    """要保留 N 个槽，ctx 最多能到多少（0 = 算不出来）。"""
++    kvpt = kvpt_for(ci)
++    slot = float(ci.get("slot_mib") or 0.0)
++    budget = int(ci.get("budget") or 0)
++    if kvpt <= 0 or slot <= 0 or budget <= 0:
++        return 0
++    return max(0, int((budget - slots * slot) / kvpt))
++
++
++def label(ci: dict, lang: str = "zh") -> str:
++    """capacity 的口径说明（内存先撞 / 整窗常驻）。"""
++    en = lang == "en"
++    if ci["basis"] == "ram":
++        return f"RAM bound <= {ci['ctx']} ctx" if en else f"内存上限 ≤{ci['ctx']} ctx"
++    return f"VRAM-window >= {ci['ctx']} ctx" if en else f"整窗常驻 ≥{ci['ctx']} ctx"
+diff --git a/ctl/observe.py b/ctl/observe.py
+new file mode 100644
+index 00000000..b21eb596
+--- /dev/null
++++ b/ctl/observe.py
+@@ -0,0 +1,83 @@
++"""运行时观测（P3）：只在这里解析引擎/服务端日志。
++
++界面（AHK）每 5 秒刷新一次状态，需要的数字全部来自这里：
++
++    expert cache 544 slots, 0.75 GiB of VRAM   ->  slots / cache_mib
++    drafts accepted 12 of 14                   ->  accept_pct / accept_a / accept_b
++    26.9 tok/s                                 ->  tok_s（取最后一次）
++    context 9216 tokens                        ->  n_ctx（服务端 ready 行）
++    low-RAM mode: ...                          ->  low_ram（或者在 run 配置里有 --mmap-experts）
++
++约定：解析不到就返回 None / 0，**绝不猜**。界面据此决定显示还是留空。
++"""
++
++from __future__ import annotations
++
++import re
++
++SLOTS_RE = re.compile(r"expert cache (\d+) slots(?:, ([\d.]+) GiB)?")
++ACCEPT_RE = re.compile(r"drafts accepted (\d+) of (\d+)")
++TOK_RE = re.compile(r"([\d.]+) tok/s")
++CTX_RE = re.compile(r"context (\d+) tokens")
++
++
++def _last(pattern: re.Pattern, text: str, cast=str):
++    hits = pattern.findall(text or "")
++    if not hits:
++        return None
++    return cast(hits[-1]) if not isinstance(hits[-1], tuple) else hits[-1]
++
++
++def expert_slots(text: str) -> int:
++    """最后一次 "expert cache N slots"。槽数是判断"ctx 有没有把显存吃光"最直接的数。"""
++    hits = SLOTS_RE.findall(text or "")
++    return int(hits[-1][0]) if hits else 0
++
++
++def cache_mib(text: str) -> int:
++    hits = SLOTS_RE.findall(text or "")
++    if not hits or not hits[-1][1]:
++        return 0
++    return int(round(float(hits[-1][1]) * 1024))
++
++
++def accept(text: str) -> dict:
++    """最后一次 "drafts accepted A of B" -> {pct, a, b}；B=0 视作没有数据。"""
++    hits = ACCEPT_RE.findall(text or "")
++    for a, b in reversed(hits):
++        a, b = int(a), int(b)
++        if b > 0:
++            return {"pct": round(a * 100 / b), "a": a, "b": b}
++    return {"pct": 0, "a": 0, "b": 0}
++
++
++def tok_s(text: str) -> float:
++    hits = TOK_RE.findall(text or "")
++    return float(hits[-1]) if hits else 0.0
++
++
++def n_ctx(server_text: str) -> int:
++    v = _last(CTX_RE, server_text or "", int)
++    return int(v) if v else 0
++
++
++def low_ram(server_text: str, run_config_text: str = "") -> bool:
++    """low-RAM 的判据：run 配置里显式要求，或服务端日志里出现过 low-RAM 提示。"""
++    if run_config_text and ("--mmap-experts" in run_config_text or "--resident-experts" in run_config_text):
++        return True
++    return "low-RAM mode:" in (server_text or "")
++
++
++def snapshot(engine_text: str = "", server_text: str = "", run_config_text: str = "") -> dict:
++    """一次刷新需要的全部运行时数字（缺的就是 0 / False）。"""
++    a = accept(engine_text)
++    return {
++        "slots": expert_slots(engine_text),
++        "cache_mib": cache_mib(engine_text),
++        "accept_pct": a["pct"],
++        "accept_a": a["a"],
++        "accept_b": a["b"],
++        "tok_s": tok_s(engine_text),
++        "n_ctx": n_ctx(server_text),
++        "low_ram": low_ram(server_text, run_config_text),
++    }
+diff --git a/ctl/params.py b/ctl/params.py
+new file mode 100644
+index 00000000..bae481bc
+--- /dev/null
++++ b/ctl/params.py
+@@ -0,0 +1,82 @@
++"""参数归一化：`mtp_mode` / `kv` / `resident` / `spec` 的唯一真相源。
++
++界面（AHK）只把控件值原样传进来，派生规则全部在这里。规则与实测依据：
++
++    mtp_mode=off  -> mtp=off,  mtp_cpu_moe=off, 无 --mtp 参数（保留 --spec，native pack 要求 T>=2）
++    mtp_mode=gpu  -> mtp=on,   mtp_cpu_moe=off, MTP 专家层在显存（439 MiB 绑定）
++    mtp_mode=cpu  -> mtp=on,   mtp_cpu_moe=on,  MTP 专家层在主机内存（127 MiB 绑定，省 312 MiB）
++
++实测（2026-11-24，4 GB 卡 / IQ3_S）：三种模式可用显存依次 1424 / 1736 / 1863 MiB。
++"""
++
++from __future__ import annotations
++
++VALID_MTP_MODES = ("gpu", "cpu", "off")
++VALID_KV = ("k8v4", "q4_0", "int8", "fp16")
++
++# mtp_mode -> (mtp, mtp_cpu_moe, spec)
++# spec 的取值：native (IQ) pack 硬要求 T >= 2；cpu 模式沿用长模式实测最优 2，其余 3
++_MTP_TABLE = {
++    "gpu": ("on", "off", 3),
++    "cpu": ("on", "on", 2),
++    "off": ("off", "off", 3),
++}
++
++
++def normalize(params: dict) -> dict:
++    """把界面参数归一化成"引擎真正会收到的东西"。
++
++    入参（缺省即可）：mtp_mode, kv, kv_resident, ctx, reserve, spec
++    返回：mtp, mtp_cpu_moe, spec, kv, kv_resident + 原样带回的 ctx/reserve
++    """
++    mtp_mode = str(params.get("mtp_mode") or "gpu").strip().lower()
++    if mtp_mode not in VALID_MTP_MODES:
++        mtp_mode = "gpu"
++    kv = str(params.get("kv") or "k8v4").strip().lower()
++    if kv not in VALID_KV:
++        kv = "k8v4"
++
++    mtp, cpu_moe, spec_default = _MTP_TABLE[mtp_mode]
++    spec_raw = params.get("spec")
++    try:
++        spec = int(spec_raw) if spec_raw not in (None, "") else spec_default
++    except (TypeError, ValueError):
++        spec = spec_default
++    if spec < 2:                      # native pack 的硬要求
++        spec = 2
++
++    try:
++        resident = int(params.get("kv_resident") or 0)
++    except (TypeError, ValueError):
++        resident = 0
++    if resident != 0 and resident < 20480:
++        resident = 0                  # 引擎只接受 0 或 >= 20480
++
++    return {
++        "mtp_mode": mtp_mode,
++        "mtp": mtp,
++        "mtp_cpu_moe": cpu_moe,
++        "spec": spec,
++        "kv": kv,
++        "kv_resident": resident,
++        "ctx": params.get("ctx", ""),
++        "reserve": params.get("reserve", ""),
++    }
++
++
++def capacity_slug_suffix(r: dict) -> str:
++    """capacity 文件名后缀：-mtpgpu / -mtpcpu / -nomtp（三种模式互不覆盖）。"""
++    if r["mtp"] == "off":
++        return "nomtp"
++    return "mtpcpu" if r["mtp_cpu_moe"] == "on" else "mtpgpu"
++
++
++def engine_flags(r: dict) -> list[str]:
++    """按归一化结果生成 MTP 相关参数（其余参数仍由界面/驱动拼）。"""
++    flags: list[str] = []
++    if r["mtp"] == "off":
++        flags += ["--mtp", "off"]     # 驱动会把它翻译成"不带 --mtp"
++    if r["mtp_cpu_moe"] == "on":
++        flags += ["--mtp-cpu-moe", "1"]
++    flags += ["--spec", str(r["spec"])]
++    return flags
+diff --git a/ctl/preflight.py b/ctl/preflight.py
+new file mode 100644
+index 00000000..bfa47c88
+--- /dev/null
++++ b/ctl/preflight.py
+@@ -0,0 +1,92 @@
++"""预检提醒（P4）：判定逻辑在这里，文案在界面。
++
++为什么 errors 没搬过来：它们全是"本机事实查询"（引擎/服务层/驱动/模板在不在），
++界面本来就拿着这些路径，搬过来只会多一层传参和一次进程启动，没有收益。
++**需要判断、比较、组合规则的部分**（显存预算、ctx 与上限/建议的关系、内存余量、
++已有实例、护栏）才是真正容易写错的地方，全部集中在这里，输出机器码 + 参数。
++
++调用方（AHK）负责：
++1. 用现成的查询结果组 `facts`（不要在这里做系统探测）；
++2. 把 `code` 翻译成中/英文案（i18n 留在有语言的那一层）；
++3. `hard=True` 的条目当成"不能启动"，其余当提醒。
++"""
++
++from __future__ import annotations
++
++# 与 serve/prepare.py 的口径一致
++VRAM_BUDGET_FLOOR_MIB = 700     # 权重 + reserve 之后低于这个值，MTP 专家再放显存放不下 prefill 缓冲
++MODEL_NEED_MB = 12288           # 专家约 12 GiB
++RAM_ABORT_MB = 500              # 护栏阈值
++SLOT_TARGET = 400               # 建议保留的专家槽数
++
++
++def warnings(params: dict, facts: dict) -> list[dict]:
++    """返回 [{code, params, hard}]；顺序稳定，界面按顺序显示。"""
++    out: list[dict] = []
++    mtp_cpu = facts.get("mtp_cpu_moe", params.get("mtp_cpu_moe")) in ("on", True, 1)
++
++    if not facts.get("model_path"):
++        out.append({"code": "model.missing", "params": {}, "hard": False, "priority": 10})
++
++    pack = facts.get("pack_problem") or ""
++    if pack:
++        out.append({"code": "pack.prepare", "params": {"detail": pack}, "hard": False, "priority": 40})
++
++    budget = int(facts.get("budget_mib") or 0)
++    if budget > 0 and budget < VRAM_BUDGET_FLOOR_MIB and not mtp_cpu:
++        out.append({"code": "vram.budget.low", "params": {"budget": budget}, "hard": False, "priority": 20})
++
++    ceiling = int(facts.get("ceiling") or 0)
++    suggested = int(facts.get("suggested") or 0)
++    ctx = int(params.get("ctx") or 0)
++    # 只用**本机实测点**判断：ctx->槽位做线性外推的误差极大（实测 20480 是 400+ 槽，
++    # 而按 budget/kvpt 外推会得到 900+），所以没有实测点就不出这条提醒。
++    seen_ctx = int(facts.get("seen_ctx") or 0)
++    seen_slots = int(facts.get("seen_slots") or 0)
++    if ceiling > 0 and ctx > ceiling:
++        out.append({"code": "ctx.over.ceiling",
++                    "params": {"ctx": ctx, "ceiling": ceiling}, "hard": False, "priority": 30})
++    elif seen_ctx > 0 and seen_slots > 0 and seen_ctx <= ctx and seen_slots < SLOT_TARGET:
++        out.append({"code": "ctx.starves.cache",
++                    "params": {"ctx": ctx, "seen_ctx": seen_ctx, "seen_slots": seen_slots,
++                               "target": SLOT_TARGET},
++                    "hard": False, "priority": 50})
++
++    ram_free = int(facts.get("ram_free_mb") if facts.get("ram_free_mb") is not None else -1)
++    ram_total = int(facts.get("ram_total_mb") or 0)
++    if ram_free >= 0:
++        if ram_free < RAM_ABORT_MB:
++            out.append({"code": "ram.critical",
++                        "params": {"free": ram_free, "abort": RAM_ABORT_MB}, "hard": True, "priority": 0})
++        elif ram_free < MODEL_NEED_MB:
++            out.append({"code": "ram.low",
++                        "params": {"free": ram_free, "total": ram_total, "need": MODEL_NEED_MB,
++                                   "abort": RAM_ABORT_MB}, "hard": False, "priority": 25})
++
++    if facts.get("engine_pid") or facts.get("serve_pid"):
++        out.append({"code": "instance.running",
++                    "params": {"engine": facts.get("engine_pid") or "-",
++                               "serve": facts.get("serve_pid") or "-"}, "hard": False, "priority": 60})
++    if facts.get("guard_pid"):
++        out.append({"code": "guard.running",
++                    "params": {"pid": facts["guard_pid"]}, "hard": False, "priority": 70})
++    # 顺序也是逻辑：阻塞项（priority 0）在前，其余按 priority 升序
++    out.sort(key=lambda i: (i.get("priority", 999), i.get("code", "")))
++    return out
++
++
++def blocking(items: list[dict]) -> bool:
++    return any(i.get("hard") for i in items)
++
++
++def summary(items: list[dict], top: int = 3) -> dict:
++    """弹窗要的"先说什么"：条数、阻塞条数、最要紧的几条 code（按 priority 升序）。
++
++    界面据此决定弹窗的行数与顺序，不必自己比较规则 —— 那正是容易写错的地方。
++    """
++    ordered = sorted(items, key=lambda i: (i.get("priority", 999), i.get("code", "")))
++    return {
++        "count": len(ordered),
++        "hard_count": sum(1 for i in ordered if i.get("hard")),
++        "top": [i["code"] for i in ordered[:top]],
++    }
+diff --git a/ctl/tests/__init__.py b/ctl/tests/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/ctl/tests/test_observe.py b/ctl/tests/test_observe.py
+new file mode 100644
+index 00000000..6377b702
+--- /dev/null
++++ b/ctl/tests/test_observe.py
+@@ -0,0 +1,94 @@
++"""测试：运行时观测（P3）。日志片段取自真实运行（2026-11-25 的三次启动 + 历史 low-RAM 段）。"""
++
++import unittest
++
++from strata.ctl import observe as O
++
++# 4 槽（大 ctx 挤光缓存）——实测 7.5 tok/s
++LOG_STARVED = """strata generate: expert cache 4 slots, 0.01 GiB of VRAM; policy is
++strata generate: drafts accepted 3 of 4
++strata generate: 7.5 tok/s
++"""
++
++# 544 槽（cpu 模式）
++LOG_CPU = """strata generate: expert cache 544 slots, 0.75 GiB of VRAM; policy is
++strata generate: drafts accepted 12 of 14
++strata generate: 37.6 tok/s
++"""
++
++# 两次启动，取最后一次
++LOG_TWICE = """strata generate: expert cache 316 slots, 0.43 GiB of VRAM; policy is
++strata generate: expert cache 584 slots, 0.80 GiB of VRAM; policy is
++strata generate: 26.9 tok/s
++"""
++
++SERVER = "ready: http://127.0.0.1:1339/v1  (context 9216 tokens)"
++SERVER_LOWRAM = ("[prepare] low-RAM mode: mapping the experts from the model files (about 15 GB)\n"
++                 + SERVER)
++
++
++
++class TestSlots(unittest.TestCase):
++    def test_starved(self):
++        self.assertEqual(O.expert_slots(LOG_STARVED), 4)
++        self.assertEqual(O.cache_mib(LOG_STARVED), 10)
++
++    def test_cpu(self):
++        self.assertEqual(O.expert_slots(LOG_CPU), 544)
++        self.assertEqual(O.cache_mib(LOG_CPU), 768)
++
++    def test_last_wins(self):
++        self.assertEqual(O.expert_slots(LOG_TWICE), 584)
++
++    def test_absent(self):
++        self.assertEqual(O.expert_slots("no model loaded yet"), 0)
++        self.assertEqual(O.cache_mib(""), 0)
++
++
++class TestAccept(unittest.TestCase):
++    def test_pct(self):
++        a = O.accept(LOG_CPU)
++        self.assertEqual((a["a"], a["b"], a["pct"]), (12, 14, 86))
++
++    def test_zero_total_ignored(self):
++        self.assertEqual(O.accept("drafts accepted 0 of 0")["pct"], 0)
++
++    def test_last_wins(self):
++        txt = "drafts accepted 1 of 2\ndrafts accepted 9 of 10"
++        self.assertEqual(O.accept(txt)["pct"], 90)
++
++
++class TestSpeedAndCtx(unittest.TestCase):
++    def test_tok_s(self):
++        self.assertAlmostEqual(O.tok_s(LOG_CPU), 37.6, places=1)
++
++    def test_n_ctx(self):
++        self.assertEqual(O.n_ctx(SERVER), 9216)
++        self.assertEqual(O.n_ctx(""), 0)
++
++    def test_low_ram(self):
++        self.assertTrue(O.low_ram(SERVER_LOWRAM))
++        self.assertFalse(O.low_ram(SERVER))
++        self.assertTrue(O.low_ram(SERVER, '{"args": ["--mmap-experts"]}'))
++        self.assertFalse(O.low_ram(SERVER, '{"args": []}'))
++
++
++class TestSnapshot(unittest.TestCase):
++    def test_full(self):
++        s = O.snapshot(LOG_CPU, SERVER)
++        self.assertEqual(s["slots"], 544)
++        self.assertEqual(s["accept_pct"], 86)
++        self.assertAlmostEqual(s["tok_s"], 37.6, places=1)
++        self.assertEqual(s["n_ctx"], 9216)
++        self.assertFalse(s["low_ram"])
++
++    def test_empty(self):
++        s = O.snapshot()
++        self.assertEqual(s["slots"], 0)
++        self.assertEqual(s["accept_pct"], 0)
++        self.assertEqual(s["n_ctx"], 0)
++        self.assertFalse(s["low_ram"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/ctl/tests/test_params.py b/ctl/tests/test_params.py
+new file mode 100644
+index 00000000..201d67fd
+--- /dev/null
++++ b/ctl/tests/test_params.py
+@@ -0,0 +1,142 @@
++"""测试：参数归一化（P1）+ 边界/建议值读取（P2）。"""
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from strata.ctl import fit
++from strata.ctl import params as P
++
++
++class TestMtpDerivation(unittest.TestCase):
++    def test_gpu(self):
++        r = P.normalize({"mtp_mode": "gpu"})
++        self.assertEqual(r["mtp"], "on")
++        self.assertEqual(r["mtp_cpu_moe"], "off")
++        self.assertEqual(P.capacity_slug_suffix(r), "mtpgpu")
++
++    def test_cpu(self):
++        r = P.normalize({"mtp_mode": "cpu"})
++        self.assertEqual(r["mtp"], "on")
++        self.assertEqual(r["mtp_cpu_moe"], "on")
++        self.assertEqual(P.capacity_slug_suffix(r), "mtpcpu")
++
++    def test_off(self):
++        r = P.normalize({"mtp_mode": "off"})
++        self.assertEqual(r["mtp"], "off")
++        self.assertEqual(r["mtp_cpu_moe"], "off")
++        self.assertEqual(P.capacity_slug_suffix(r), "nomtp")
++
++
++class TestSpecAndFlags(unittest.TestCase):
++    def test_spec_floor(self):
++        self.assertEqual(P.normalize({"mtp_mode": "gpu", "spec": 0})["spec"], 2)
++        self.assertEqual(P.normalize({"mtp_mode": "gpu", "spec": 1})["spec"], 2)
++
++    def test_spec_passthrough(self):
++        self.assertEqual(P.normalize({"mtp_mode": "gpu", "spec": 5})["spec"], 5)
++
++    def test_flags_cpu(self):
++        f = P.engine_flags(P.normalize({"mtp_mode": "cpu"}))
++        self.assertIn("--mtp-cpu-moe", f)
++        self.assertEqual(f[f.index("--mtp-cpu-moe") + 1], "1")
++
++    def test_flags_gpu_no_cpumoe(self):
++        self.assertNotIn("--mtp-cpu-moe", P.engine_flags(P.normalize({"mtp_mode": "gpu"})))
++
++    def test_flags_off(self):
++        f = P.engine_flags(P.normalize({"mtp_mode": "off"}))
++        self.assertNotIn("--mtp-cpu-moe", f)
++        self.assertIn("--mtp", f)
++
++
++class TestSanitising(unittest.TestCase):
++    def test_bad_mode_falls_back_to_gpu(self):
++        self.assertEqual(P.normalize({"mtp_mode": "bogus"})["mtp_mode"], "gpu")
++
++    def test_bad_kv_falls_back(self):
++        self.assertEqual(P.normalize({"kv": "nope"})["kv"], "k8v4")
++
++    def test_resident_below_floor_becomes_zero(self):
++        self.assertEqual(P.normalize({"kv_resident": 8192})["kv_resident"], 0)
++        self.assertEqual(P.normalize({"kv_resident": 20480})["kv_resident"], 20480)
++
++
++NATIVE = "E:" + chr(92) + "m" + chr(92) + "Cyber-UD-IQ4_XS.gguf"
++
++
++def write_cap(results, slug, **over):
++    d = {
++        "model": "Cyber-UD-IQ4_XS.gguf",
++        "kv": "k8v4",
++        "mtp_cpu_moe": slug == "mtpcpu",
++        "ctx_estimate": 74752,
++        "ctx_estimate_basis": "vram",
++        "ctx_suggested": 8192,
++        "vram_budget_mib": 981,
++        "expert_slot_mib": 1.445,
++        "kv_measured_mib_per_token": 0.0328,
++    }
++    d.update(over)
++    f = fit.capacity_file(results, NATIVE, "k8v4", slug)
++    f.parent.mkdir(parents=True, exist_ok=True)
++    f.write_text(json.dumps(d), encoding="utf-8")
++    return f
++
++
++class TestCapacityRead(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.mkdtemp()
++
++    def test_absent_is_not_measured(self):
++        b = fit.boundary(self.tmp, NATIVE, "k8v4", "on", "off")
++        self.assertFalse(b["measured"])
++        self.assertEqual(b["ok"], 0)
++
++    def test_reads_ceiling_and_suggestion(self):
++        write_cap(self.tmp, "mtpgpu")
++        b = fit.boundary(self.tmp, NATIVE, "k8v4", "on", "off")
++        self.assertTrue(b["measured"])
++        self.assertEqual(b["ok"], 74752)
++        self.assertEqual(b["rec"], 8192)
++        self.assertAlmostEqual(b["kvpt"], 0.0328, places=4)
++
++    def test_wrong_slug_does_not_leak(self):
++        write_cap(self.tmp, "mtpgpu")
++        b = fit.boundary(self.tmp, NATIVE, "k8v4", "on", "on")   # 要 mtpcpu
++        self.assertFalse(b["measured"])
++
++    def test_mtp_flag_mismatch_rejected(self):
++        # 文件说 cpu_moe=true，但按 mtpgpu 去读 -> 拒绝
++        write_cap(self.tmp, "mtpgpu", mtp_cpu_moe=True)
++        self.assertFalse(fit.boundary(self.tmp, NATIVE, "k8v4", "on", "off")["measured"])
++
++    def test_wrong_model_rejected(self):
++        write_cap(self.tmp, "mtpgpu", model="other.gguf")
++        self.assertFalse(fit.boundary(self.tmp, NATIVE, "k8v4", "on", "off")["measured"])
++
++    def test_bad_json_is_not_measured(self):
++        f = fit.capacity_file(self.tmp, NATIVE, "k8v4", "mtpgpu")
++        f.parent.mkdir(parents=True, exist_ok=True)
++        f.write_text("{not json", encoding="utf-8")
++        self.assertFalse(fit.boundary(self.tmp, NATIVE, "k8v4", "on", "off")["measured"])
++
++    def test_nomtp_accepts_missing_flag(self):
++        f = fit.capacity_file(self.tmp, NATIVE, "k8v4", "nomtp")
++        f.parent.mkdir(parents=True, exist_ok=True)
++        f.write_text(json.dumps({"model": "Cyber-UD-IQ4_XS.gguf", "kv": "k8v4",
++                                 "ctx_estimate": 99328, "ctx_suggested": 12288}), encoding="utf-8")
++        b = fit.boundary(self.tmp, NATIVE, "k8v4", "off", "off")
++        self.assertTrue(b["measured"])
++        self.assertEqual(b["ok"], 99328)
++
++    def test_labels(self):
++        write_cap(self.tmp, "mtpgpu", ctx_estimate_basis="ram")
++        ci = fit.capacity_info(self.tmp, NATIVE, "k8v4", "mtpgpu")
++        self.assertIn("RAM", fit.label(ci, "en"))
++        self.assertIn("内存", fit.label(ci, "zh"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/ctl/tests/test_preflight.py b/ctl/tests/test_preflight.py
+new file mode 100644
+index 00000000..7e869b08
+--- /dev/null
++++ b/ctl/tests/test_preflight.py
+@@ -0,0 +1,137 @@
++"""测试：预检提醒（P4）。六个场景，断言 code 集合与 hard 标记。"""
++
++import unittest
++
++from strata.ctl import preflight as PF
++
++P = {"ctx": 8192, "mtp_cpu_moe": "off"}
++
++
++def facts(**over):
++    base = {"model_path": "m.gguf", "budget_mib": 1200, "ceiling": 74752, "suggested": 8192,
++            "ram_free_mb": 20000, "ram_total_mb": 32768, "engine_pid": 0, "serve_pid": 0,
++            "guard_pid": 0, "pack_problem": ""}
++    base.update(over)
++    return base
++
++
++def codes(items):
++    return [i["code"] for i in items]
++
++
++class TestScenarios(unittest.TestCase):
++    def test_normal(self):
++        self.assertEqual(codes(PF.warnings(P, facts())), [])
++
++    def test_vram_budget_low(self):
++        out = PF.warnings(P, facts(budget_mib=650))
++        self.assertIn("vram.budget.low", codes(out))
++        # cpu 模式已经让出了 MTP 那 300 MiB，不再提醒
++        self.assertNotIn("vram.budget.low", codes(PF.warnings({**P, "mtp_cpu_moe": "on"}, facts(budget_mib=650))))
++
++    def test_ctx_over_ceiling(self):
++        out = PF.warnings({**P, "ctx": 90000}, facts())
++        self.assertIn("ctx.over.ceiling", codes(out))
++        self.assertNotIn("ctx.starves.cache", codes(out))   # 超上限只说上限，不重复
++
++    def test_ctx_starves_cache_from_measurement(self):
++        # 只用实测点：本机在 40960 那次量到 120 槽（<400）-> 报；ctx 比它小就不报
++        out = PF.warnings({**P, "ctx": 49152}, facts(seen_ctx=40960, seen_slots=120))
++        self.assertIn("ctx.starves.cache", codes(out))
++        self.assertEqual(out[0]["params"]["target"], 400)
++        self.assertEqual(out[0]["params"]["seen_slots"], 120)
++        # 用户实测：IQ3_S gpu @20480 是 657 槽 -> 不该报
++        self.assertNotIn("ctx.starves.cache",
++                         codes(PF.warnings({**P, "ctx": 20480}, facts(seen_ctx=20480, seen_slots=657))))
++
++    def test_no_measurement_no_warning(self):
++        # 没有实测点就不猜（ctx 远大于建议值也不报"挤光缓存"）
++        self.assertNotIn("ctx.starves.cache",
++                         codes(PF.warnings({**P, "ctx": 65536}, facts(suggested=16384))))
++
++    def test_ram_low_and_critical(self):
++        low = PF.warnings(P, facts(ram_free_mb=6000))
++        self.assertIn("ram.low", codes(low))
++        self.assertFalse(PF.blocking(low))
++        crit = PF.warnings(P, facts(ram_free_mb=300))
++        self.assertIn("ram.critical", codes(crit))
++        self.assertTrue(PF.blocking(crit))
++
++    def test_instances_and_guard(self):
++        out = PF.warnings(P, facts(engine_pid=1234, serve_pid=5678, guard_pid=9012))
++        self.assertIn("instance.running", codes(out))
++        self.assertIn("guard.running", codes(out))
++        self.assertEqual(out[0]["params"]["engine"], 1234)
++
++    def test_model_and_pack(self):
++        out = PF.warnings(P, facts(model_path="", pack_problem="need a pack"))
++        self.assertEqual(codes(out)[:2], ["model.missing", "pack.prepare"])
++
++    def test_priority_order_and_summary(self):
++        out = PF.warnings(P, facts(model_path="", ram_free_mb=300, guard_pid=7))
++        s = PF.summary(out)
++        self.assertEqual(s["count"], 3)
++        self.assertEqual(s["hard_count"], 1)
++        # ram.critical(0) 先于 model.missing(10) 先于 guard.running(70)
++        self.assertEqual(s["top"], ["ram.critical", "model.missing", "guard.running"])
++
++    def test_priority_field_present(self):
++        for item in PF.warnings(P, facts(budget_mib=600, ram_free_mb=300)):
++            self.assertIn("priority", item)
++
++    def test_unknown_ram_is_skipped(self):
++        # ram_free_mb=None 表示"查不到"，不能误报
++        self.assertEqual(codes(PF.warnings(P, facts(ram_free_mb=None))), [])
++
++
++class TestValidate(unittest.TestCase):
++    def test_ok(self):
++        from strata.ctl import env as E
++        self.assertEqual(E.validate({"ctx": "8192", "port": 1339, "vram_reserve_mib": 64,
++                                     "kv_resident": 0}), [])
++
++    def test_bad_values(self):
++        from strata.ctl import env as E
++        codes = [e["code"] for e in E.validate({"ctx": "0", "port": 70000,
++                                                "vram_reserve_mib": -1, "kv_resident": 4096})]
++        self.assertEqual(codes, ["ctx.invalid", "port.invalid", "reserve.invalid", "resident.invalid"])
++
++    def test_blank_skipped(self):
++        from strata.ctl import env as E
++        self.assertEqual(E.validate({"ctx": "", "port": None}), [])
++
++
++class TestEnv(unittest.TestCase):
++    def setUp(self):
++        import os
++        self._path = os.environ.get("PATH", "")
++        os.environ["PATH"] = ""          # 隔离：本机 PATH 里确实有 CUDA DLL
++
++    def tearDown(self):
++        import os
++        os.environ["PATH"] = self._path
++
++    def test_missing_dlls(self):
++        from strata.ctl import env as E
++        got = E.check_env(lib_dirs=[], cap="8.6")
++        self.assertEqual([g["code"] for g in got], ["env.cudart.missing", "env.cublas.missing"])
++        self.assertFalse(any(g["hard"] for g in got))
++
++    def test_dlls_found(self):
++        import tempfile, pathlib
++        from strata.ctl import env as E
++        d = pathlib.Path(tempfile.mkdtemp())
++        for name in E.CUDA_DLLS:
++            (d / name).write_bytes(b"")
++        self.assertEqual(E.check_env(lib_dirs=[str(d)], cap="8.6"), [])
++
++    def test_sm_mismatch_soft(self):
++        from strata.ctl import env as E
++        got = E.check_env(lib_dirs=[], cap="8.9")
++        sm = [g for g in got if g["code"] == "env.sm.mismatch"]
++        self.assertTrue(sm and not sm[0]["hard"])
++        self.assertEqual(sm[0]["params"]["flag"], "-arch=sm_89")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/serve/prepare.py b/serve/prepare.py
+index be2bc7c3..74e5692d 100644
+--- a/serve/prepare.py
++++ b/serve/prepare.py
+@@ -10,6 +10,7 @@ already names the same GGUF, nothing happens.
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import pathlib
+ import re
+@@ -178,6 +179,315 @@ def model_expert_bytes(pack: pathlib.Path | None, gguf: pathlib.Path) -> int | N
+         return None
+ 
+ 
++# Bytes of KV per cell per layer, by --kv (the engine's own layouts).
++KV_BYTES_PER_CELL = {"fp16": 2048, "int8": 1056, "k8v4": 816, "q4_0": 528}
++
++
++def model_shapes(gguf: pathlib.Path) -> dict | None:
++    """n_layers, dense bytes (weights that live in VRAM) and the expert bytes, from the header alone."""
++    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
++    if tools.is_dir() and str(tools) not in sys.path:
++        sys.path.insert(0, str(tools))
++    try:
++        import gguf_reader as G
++        g = G.GGUFFile(gguf)
++        arch = g.metadata.get("general.architecture") or ""
++        blocks = g.metadata.get(arch + ".block_count")
++        nextn = g.metadata.get(arch + ".nextn_predict_layers") or 0
++        if not blocks:
++            return None
++        n_layers = int(blocks) - int(nextn)                 # the MTP block is not a main layer
++        dense = experts = 0
++        for t in g.tensors:
++            nb = t.expected_bytes() or 0
++            if t.name.endswith("_exps.weight"):
++                experts += nb
++            elif t.name == "per_layer_token_embd.weight":   # the PLE table is read from its own GGUF
++                continue
++            else:
++                dense += nb
++        ctx_train = g.metadata.get(arch + ".context_length") or 0
++        return {"layers": n_layers, "dense": dense, "experts": experts,
++                "ctx_train": int(ctx_train)}
++    except Exception:
++        return None
++
++
++# 建议 ctx 的模型（全部来自实测，见 ensure_fit）：
++#   * 每 token 的 K/V 在显存里约占 KV_MIB_PER_TOKEN（全量 32.6 KiB 的 ~35%，其余从主机内存流式）
++#   * 一个专家槽 = 专家总字节 / (层数 × 每层专家数)；量化越大，槽越大 —— 所以按「保留多少比例的专家」
++#     来分显存，天然适配不同量化
++CTX_PER_MIB = 77               # 显存每 MiB（扣掉权重与 MTP 头）约换多少 token 的上下文：
++                               #   短模式 1376 MiB -> 106496（77.4）；长模式 1688 -> 139264（82.5）；
++                               #   MTP off 1815 -> 160768（88.6）。取最小，保证不超实测。
++SUGGEST_MAX_FRACTION = 0.8     # 建议值不超过上限的 80%（KV 分配是离散的，留余量）
++KV_MIB_PER_TOKEN = 0.032      # 每 token 的 K/V 在显存里占多少 MiB。实测：Cyber IQ4_XS 上 31.4/36.1/29.2 KiB
++                               # （≈ 完整 KV = 816 B × 40 层 = 32.6 KiB，KV 并没有流式）；IQ3_S 上约 12 KiB（部分流式）。
++                               # 取最坏情况 0.032，宁可建议值保守，也不承诺保不住的槽位。
++CACHE_KEEP_FRACTION = 0.45     # 扣掉固定开销后，显存预算里留给专家缓存的比例（实测反推：IQ3_S 短模式
++                               # 20k ctx -> 969 槽 / 65k -> 590 槽；Cyber IQ4_XS 53k -> 258 槽，都落在这条线上）
++VRAM_FIXED_MIB = 400           # verify 窗口(178) + prompt 缓冲 + token graph 等固定占用（实测反推 380-430）
++CACHE_KEEP_FLOOR = 400         # 但至少留这么多槽（引擎自己要求 >=287 才能跑 verify）
++
++
++def gpu_free_mib() -> int | None:
++    try:
++        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
++                             capture_output=True, text=True, timeout=10)
++        return int(out.stdout.strip().splitlines()[0])
++    except Exception:
++        return None
++
++
++def ensure_fit(cfg: dict, log=print) -> bool:
++    """Say how much context this model+kv can actually hold, and clamp --pool-workers to the cores.
++
++    --max-context is a requirement, so it is only *reported*, never changed -- the engine refuses
++    with the exact shortfall anyway.  --pool-workers copied from another machine is clamped.
++    """
++    if os.environ.get("STRATA_NO_BUDGET") == "1":
++        return False
++    args = list(cfg.get("args") or [])
++    native = _arg(args, "--native")
++    if not native:
++        return False
++    gguf = pathlib.Path(native)
++    if not gguf.is_file():
++        return False
++    changed = False
++
++    # ---- pool workers: never more than the physical cores
++    try:
++        import psutil
++        phys = psutil.cpu_count(logical=False) or 0
++    except Exception:
++        phys = 0
++    if phys and "--pool-workers" in args:
++        try:
++            cur = int(args[args.index("--pool-workers") + 1])
++        except ValueError:
++            cur = 0
++        if cur > phys:
++            want = max(1, phys - 2)
++            args[args.index("--pool-workers") + 1] = str(want)
++            changed = True
++            log(f"[prepare] --pool-workers {cur} -> {want} (this machine has {phys} physical cores)")
++
++    # ---- how much context fits: free VRAM - weights - MTP - reserve, divided by the KV per cell
++    shapes = model_shapes(gguf)
++    free = gpu_free_mib()
++    if free is not None and free < 512:
++        # 还剩不到 512 MiB：多半已经有一个引擎占着显存。此时算出来的上限/建议没有意义，
++        # 写了反而会把界面数字带偏（曾写出 ctx_suggested=0）。跳过，保留上一次的值。
++        log(f"[prepare] fit: only {free} MiB of VRAM free - is another engine already running? "
++            f"skipping the ceiling/suggestion for this start (the previous capacity file is kept)")
++        return changed
++    kv = _arg(args, "--kv") or "k8v4"
++    bpc = KV_BYTES_PER_CELL.get(kv)
++    if shapes and free and bpc:
++        reserve = int(_arg(args, "--vram-reserve-mib") or 64)
++        mtp_bind = 127 if _arg(args, "--mtp-cpu-moe") in ("1", "on") else 439
++        budget_mib = free - reserve - shapes["dense"] / 2**20 - (mtp_bind if "--mtp" in args else 0)
++        # 实测标定（2026-11-24，IQ3_S / k8v4 / 4 GB 卡）：显存每 MiB（扣掉权重与 MTP 头）约换 77-89 token 上下文，
++        # 取决于 KV 流式窗口的取整；取最保守的 77，保证估算不超实测：
++        #   短模式(MTP 在显存) 1376 MiB -> 106496（77.4）；长模式(MTP 在 CPU) 1688 -> 139264（82.5）；
++        #   MTP off 1815 MiB -> 160768（88.6，这是上限，对应把 MTP 的显存省下来）
++        ctx_max = int(max(0, budget_mib) * CTX_PER_MIB / 1024) * 1024
++        want = int(_arg(args, "--max-context") or 0)
++        log(f"[prepare] fit: weights {shapes['dense'] / 2**20:.0f} MiB, free VRAM {free} MiB, "
++            f"{kv} {bpc} B/cell x {shapes['layers']} layers -> up to about {ctx_max} ctx "
++            f"(calibrated: {CTX_PER_MIB} ctx per MiB of VRAM left after the weights and the MTP head; "
++            f"that is where the MTP verify tier runs out of VRAM and the engine refuses to start)")
++        # KV 流式要显式打开：--kv-resident N（N >= 20480）才把 K/V 放固定内存、显存只留 N 个 cell 的
++        # 注意力窗口；**0（默认）= 全部 KV 驻显存**（引擎 help 原文；实测 IQ3_S @20480 只剩 657 槽也印证）。
++        # 原来这里写成 `not resident`，把默认当成了流式 —— 日志和守卫因此都是反的。
++        ctx_ram = 0
++        resident = int(_arg(args, "--kv-resident") or 0)
++        if bpc and resident >= 20480:
++            try:
++                import psutil
++                avail = psutil.virtual_memory().available
++            except Exception:
++                avail = 0
++            pack = _arg(args, "--pack")
++            exp = model_expert_bytes(pathlib.Path(pack) if pack and "%" not in pack else None, gguf) or 0
++            room_mib = (avail - exp) / 2**20 - 500
++            if room_mib > 0:
++                ctx_ram = int(room_mib * 2**20 / (bpc * max(1, shapes["layers"])) // 1024 * 1024)
++                if shapes.get("ctx_train"):
++                    ctx_ram = min(ctx_ram, shapes["ctx_train"])
++                log(f"[prepare] fit: KV streams from RAM (--kv-resident {resident}): RAM available {avail / 2**20:.0f} MiB, "
++                    f"experts {exp / 2**20:.0f} MiB, guard 500 MiB -> up to {ctx_ram} ctx "
++                    f"(trained for {shapes.get('ctx_train') or '?'})")
++        if want > (ctx_ram or ctx_max):
++            log(f"[prepare] note --max-context {want} is past the {ctx_max} that fits all at once; "
++                f"that is fine while the conversation stays below {ctx_max} tokens (the KV grows "
++                f"lazily). If you really fill it: lower --max-context, smaller quant, or --kv q4_0 "
++                f"(528 B/cell)")
++        # ---- 建议 ctx：先保留 x% 专家槽，剩下的给 KV。
++        # KV/token 优先用**上一轮实测标定**的值（启动器从引擎日志反推后写进同一份 capacity），
++        # 没有实测过就用保守回退值 0.032（这个模型上 KV 几乎全驻显存）。
++        kvpt = KV_MIB_PER_TOKEN
++        ctx_suggested = 0
++        cache_keep_mib = 0.0
++        slot_mib = 0.0
++        if bpc and ctx_max > 0:
++            n_experts = 256                              # 每层专家数；读不到就用 256（35B-A3B 就是 256）
++            try:
++                tools2 = pathlib.Path(__file__).resolve().parent.parent / "tools"
++                if tools2.is_dir() and str(tools2) not in sys.path:
++                    sys.path.insert(0, str(tools2))
++                import gguf_reader as G2
++                meta = G2.GGUFFile(gguf).metadata
++                arch2 = meta.get("general.architecture") or ""
++                n_experts = int(meta.get(arch2 + ".expert_count") or 256)
++            except Exception:
++                pass
++            total_slots = max(1, shapes["layers"] * n_experts)
++            slot_mib = (shapes["experts"] / 2**20) / total_slots
++            room = max(0.0, budget_mib - VRAM_FIXED_MIB)
++            slug_pre = re.sub(r"[^A-Za-z0-9._-]+", "_", gguf.name) + "-" + re.sub(r"[^A-Za-z0-9._-]+", "_", kv)
++            slug_pre += ("-mtpcpu" if _arg(args, "--mtp-cpu-moe") in ("1", "on")
++                         else ("-nomtp" if "--mtp" not in args else "-mtpgpu"))
++            try:                                   # 上一轮实测的 KV/token（启动器写的）优先
++                _prev = json.loads((pathlib.Path(__file__).resolve().parent.parent.parent / "results" / "capacity" / (slug_pre + ".json")).read_text(encoding="utf-8"))
++                _meas = float(_prev.get("kv_measured_mib_per_token") or 0)
++                if _meas > 0:
++                    kvpt = max(kvpt, _meas)
++                    log(f"[prepare] using the last run's measured K/V cost {kvpt * 1024:.1f} KiB/token ({slug_pre})")
++            except Exception:
++                pass
++            keep = max(CACHE_KEEP_FRACTION * room, CACHE_KEEP_FLOOR * slot_mib)
++            if (room - keep) < 8192 * kvpt:        # 保底：至少留出 8192 的上下文
++                keep = max(0.0, room - 8192 * kvpt)
++                log(f"[prepare] too little VRAM for ~{CACHE_KEEP_FLOOR} expert slots at 8192 ctx: "
++                    f"trading cache for context ({keep / slot_mib:.0f} slots kept)")
++            cache_keep_mib = keep
++            kv_budget = max(0.0, room - keep)
++            ctx_suggested = max(8192, int(kv_budget / kvpt / 1024) * 1024)   # 1024 步进：小模型/小预算的差别才看得出来
++            cap_by = int(min(ctx_max * SUGGEST_MAX_FRACTION, shapes.get("ctx_train") or ctx_max))
++            ctx_suggested = min(ctx_suggested, cap_by // 1024 * 1024)
++            if ctx_suggested >= 8192:
++                log(f"[prepare] suggested --max-context {ctx_suggested} (keeps about {cache_keep_mib:.0f} MiB "
++                    f"= {cache_keep_mib / slot_mib:.0f} expert slots of {total_slots}, {slot_mib:.2f} MiB each; "
++                    f"the remaining {kv_budget:.0f} MiB of VRAM covers the K/V window at ~{kvpt * 1024:.0f} KiB/token). "
++                    f"Bigger windows start but starve that cache: 106496 left only 4 slots and 7.5 tok/s here")
++        # 让启动器/脚本直接读到这次算出来的容量（不问引擎、不重算）。
++        # 存两份：capacity.json = 最近一次；capacity/<model>-<kv>.json = 按模型各一份，
++        # 否则切到另一个模型（例如长模式）就显示不出估算值。
++        try:
++            root = pathlib.Path(__file__).resolve().parent.parent.parent / "results"
++            root.mkdir(parents=True, exist_ok=True)
++            doc = json.dumps({
++                "model": gguf.name, "kv": kv, "layers": shapes["layers"],
++                "weights_mib": round(shapes["dense"] / 2**20),
++                # 流式 KV 时按内存算（真正的天花板），常驻时按显存算（下限）
++                "free_vram_mib": free,
++                "vram_budget_mib": round(budget_mib),        # 权重/MTP/reserve 之后能分给 KV+专家缓存的量
++                "kv_estimate_mib_per_token": KV_MIB_PER_TOKEN,
++                  "ctx_estimate": (min(ctx_max, ctx_ram) if ctx_ram else ctx_max),
++                  "ctx_estimate_basis": ("ram" if (ctx_ram and ctx_ram < ctx_max) else "vram"),
++                "ctx_suggested": ctx_suggested,
++                "ctx_suggested_note": "keeps ~5% of the experts in VRAM (>=400 slots)",
++                "expert_slot_mib": round(slot_mib, 3),
++                "cache_keep_mib": round(cache_keep_mib),
++                  "ctx_estimate_vram_ceiling": ctx_max,
++                "ctx_ram_available_mib": round(room_mib) if ctx_ram else None,
++                "requested_ctx": want,
++                "bytes_per_cell": bpc,
++                "mtp_cpu_moe": _arg(args, "--mtp-cpu-moe") in ("1", "on"),
++            }, indent=1)
++            (root / "capacity.json").write_text(doc, encoding="utf-8")
++            per_model = root / "capacity"
++            per_model.mkdir(parents=True, exist_ok=True)
++            slug = re.sub(r"[^A-Za-z0-9._-]+", "_", gguf.name) + "-" + re.sub(r"[^A-Za-z0-9._-]+", "_", kv)
++            # MTP 的三种状态可用显存差 300+ MiB，建议值/上限都不同，必须分开存：
++            #   mtpgpu = MTP 在显存（默认） / mtpcpu = 专家上 CPU / nomtp = 不开 MTP
++            if "--mtp" not in args:
++                slug += "-nomtp"
++            elif _arg(args, "--mtp-cpu-moe") in ("1", "on"):
++                slug += "-mtpcpu"
++            else:
++                slug += "-mtpgpu"
++            (per_model / (slug + ".json")).write_text(doc, encoding="utf-8")
++        except OSError:
++            pass
++
++
++    if changed:
++        cfg["args"] = args
++    return changed
++
++
++# 判据（纯函数，可单测）：
++#   * 机器总内存 − 专家 < 6 GiB  -> 装不下：系统 + KV + 文件缓存都要位置（上游 setup 用 10 GiB，更保守）
++#   * 或此刻 MemAvailable − 专家 < 1 GiB -> 眼下就已经不够（别的程序占着）
++# 24 GB 机器（22,500 − 12,278 = 10,222 MiB）走常驻；16 GB 机器（15,000 − 12,278 = 2,722）走 low-RAM。
++LOWRAM_SPARE_MIB = 7168
++LOWRAM_FLOOR_MIB = 1024
++
++
++def lowram_needed(avail_mib: float, experts_mib: float, total_mib: float = 0,
++                  spare: int = LOWRAM_SPARE_MIB, floor: int = LOWRAM_FLOOR_MIB) -> bool:
++    """True when the resident expert arena cannot fit in RAM (pure, so it can be unit-tested)."""
++    if total_mib and (total_mib - experts_mib) < spare:
++        return True
++    return (avail_mib - experts_mib) < floor
++
++
++def ensure_lowram(cfg: dict, log=print) -> bool:
++    """Put the machine in the engine's low-RAM mode when the experts cannot be copied into RAM.
++
++    Unless the user asked for something specific, the engine otherwise copies *all* experts into
++    pinned RAM (12-15 GiB here) and a 16 GB PC dies or gets killed by the RAM guard.  With
++    --mmap-experts they are mapped from the model file instead: the OS file cache holds what the
++    GPU's expert cache does not, and it can hand that memory back under pressure.
++
++    Cost (measured, upstream and here): decode drops to roughly a third on a cold cache
++    (~12 tok/s vs ~40 on this 4 GB card), so it is only chosen when the arena genuinely does not fit.
++    STRATA_FORCE_LOWRAM=1 forces it on for testing; STRATA_NO_BUDGET=1 skips it.
++    """
++    if os.environ.get("STRATA_NO_BUDGET") == "1":
++        return False
++    args = list(cfg.get("args") or [])
++    native = _arg(args, "--native")
++    if not native:
++        return False
++    gguf = pathlib.Path(native)
++    if not gguf.is_file():
++        return False
++    if any(a in args for a in ("--mmap-experts", "--resident-experts", "--shared-expert-arena")):
++        return False
++    try:
++        import psutil
++        vm = psutil.virtual_memory()
++        avail, total = vm.available / 2**20, vm.total / 2**20
++    except Exception:
++        return False
++    pack = _arg(args, "--pack")
++    exp = model_expert_bytes(pathlib.Path(pack) if pack and "%" not in pack else None, gguf)
++    if not exp:
++        return False
++    exp_mib = exp / 2**20
++    forced = os.environ.get("STRATA_FORCE_LOWRAM") == "1"
++    if not forced and not lowram_needed(avail, exp_mib, total):
++        return False
++
++    args.append("--mmap-experts")
++    # 内存都装不下专家了，parking 池纯属自杀：关掉（引擎允许 0）
++    try:
++        if "--conversation-cache-mib" in args:
++            args[args.index("--conversation-cache-mib") + 1] = "0"
++    except (IndexError, ValueError):
++        pass
++    cfg["args"] = args
++    log(f"[prepare] low-RAM mode: RAM {avail:.0f} MiB available / {total:.0f} MiB total cannot hold the "
++        f"{exp_mib:.0f} MiB of experts plus {LOWRAM_SPARE_MIB} MiB for the system -> --mmap-experts: the experts "
++        f"are mapped from the model file and the OS file cache streams them; parked conversations off. "
++        f"WARNING: decode is roughly a third of the resident mode while that cache is cold")
++    return True
++
++
+ def ensure_budget(cfg: dict, log=print) -> bool:
+     """Shrink the discretionary host allocations when the model plus them cannot fit in RAM.
+ 
+@@ -214,10 +524,14 @@ def ensure_budget(cfg: dict, log=print) -> bool:
+         physical = psutil.virtual_memory().total
+     except Exception:
+         physical = 0
+-    big_model = physical > 0 and exp > physical * 0.40
++    # 12 GiB 的专家（32 GB 机器的 37%）就足以把 parking 池挤掉：CPU 侧专家计算一被换页就慢一截
++    ratio = (exp / physical) if physical else 0.0
++    big_model = ratio > 0.35
++    huge_model = ratio > 0.45
+     log(f"[prepare] budget: experts {exp / 2**30:.1f} GiB, RAM available {avail / 2**30:.1f} GiB, "
+         f"room for caches {max(0, room) / 2**20:.0f} MiB"
+-        + (", 35B-class model -> parked conversations capped at 1 GiB" if big_model else ""))
++        + (", experts are %.0f%% of RAM -> parked conversations capped at %d MiB"
++           % (ratio * 100, 512 if huge_model else 1024) if big_model else ""))
+ 
+     def put(flag: str, value: int, why: str) -> None:
+         nonlocal changed
+@@ -235,7 +549,9 @@ def ensure_budget(cfg: dict, log=print) -> bool:
+         fit = max(0, room) >> 20
+         fit = (fit // 256) * 256                      # round down to a round MiB step
+         if big_model:
+-            fit = min(fit, 1024)                      # a model that eats 40% of RAM leaves no room for 4 GiB of parks
++            fit = min(fit, 1024)                      # 37%+ of RAM in experts: 4 GiB of parks starves the CPU pool
++        if huge_model:
++            fit = min(fit, 512)
+         if cur > fit:
+             why = (f"a {exp / 2**30:.0f} GiB expert set leaves {max(0, room) / 2**20:.0f} MiB after the 4 GiB the engine keeps free"
+                    if not big_model else
+@@ -299,6 +615,13 @@ def ensure_vision(cfg: dict, log=print) -> bool:
+     vis = cfg.get("vision")
+     if not isinstance(vis, dict) or not vis:
+         return False
++    # --vision off 就是不想要视觉：别让模板里的 vision 块把 8 个 CPU 线程拉起来
++    # （界面上「图片」选 off，或 --vision off）
++    if _arg(list(cfg.get("args") or []), "--vision") == "off":
++        log("[prepare] --vision off: the image encoder is not started"
++            " (the config's vision block stays, it is simply unused)")
++        cfg.pop("vision", None)
++        return True
+     for key in ("exe", "mmproj", "model"):
+         raw = str(vis.get(key) or "")
+         if not raw:

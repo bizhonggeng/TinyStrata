@@ -1,461 +1,144 @@
 # TinyStrata
 
-<img src="assets/icon.png" width="96" align="right" alt="TinyStrata">
+Runs **Qwen3.6-35B-A3B (MoE, 3B active) on a 4 GB laptop GPU** at 33–43 tok/s, on Windows,
+with the whole model on one card plus the host's RAM. It is a patched build of
+[Strata](https://github.com/Niko1221/Strata) (MIT) and a launcher for it.
 
-[简体中文](README.zh-CN.md) | [English](README.md)
+Every number below was measured on the machine in §2. Nothing here is extrapolated.
 
----
+## 1. What is in the box
 
-## 1. Goal
+| Piece | What it is |
+|---|---|
+| `strata.exe` | Strata 0.1.43 + 10 patches (§5). 64,747,008 B, `sha256 8b01900e…` |
+| `TinyStrata-Launcher.exe` | GUI: pick a GGUF, press Start. 1,504,768 B, not UPX-packed |
+| `strata/ctl/` | Middle layer: parameter derivation, VRAM ceiling/suggestion, preflight codes, log parsing |
+| `patches/` | The 10 patches as `git am`-able files |
 
-> 目标：在 4G VRAM 显卡中快速、高质量、稳定的运行 MoE 模型（比如 Qwen3.6-35B-A3B）。
->
-> **Goal: run MoE models fast, with high quality and stable output, on a 4 GB VRAM card.**
+## 2. Measured performance
 
-Upstream [Strata](https://github.com/Niko1221/Strata) runs Qwen3.6-35B-A3B fine on 8–12 GB cards.
-Squeezed to 4 GB you hit three walls at once:
+Machine: **RTX 3050 Ti Laptop (4 GB VRAM)**, i5-11400H, 32 GB RAM, Windows 11,
+CUDA 12.8, display 1920×1080 @125 %.
+Model: **Qwen3.6-35B-A3B UD-IQ3_S** (14.29 GiB) with its own MTP head.
+Settings: `--kv k8v4`, `--spec 3`, `--expert-cache 800`, `--vram-reserve-mib 64`,
+`--max-context 20480`, MTP experts in VRAM.
 
-1. **It does not fit** — the MTP draft layer alone wants 439 MiB, and it has to share the card with
-   an 80 K KV cache;
-2. **It repeats itself** — at long context the decoder falls into verbatim reasoning loops, burning
-   tens of thousands of tokens without answering;
-3. **Conversations get lost** — under memory pressure parked conversations are dropped, and
-   switching back costs a full re-read.
+### Decode speed vs. context
 
-TinyStrata is three fixes for those three walls, plus the launcher, driver and benchmarks used to
-measure them. It is deliberately small: **3 patches (~430 lines) + a toolchain**, not a whole-tree fork.
+Each point: engine loaded once, GPU idle (0 MiB used) before starting, one warm-up
+request discarded, then **3 generations of 250 tokens, median shown**.
 
----
+| prompt | 1 K | 4 K | 8 K | 12 K | 16 K | 20 K |
+|---|---:|---:|---:|---:|---:|---:|
+| decode tok/s | **43.1** | 40.9 | 40.0 | 38.8 | 37.0 | 33.7 |
 
-## 2. Features
+- 1 K → 20 K costs **−22 %** (43.1 → 33.7). The slope is about −0.5 tok/s per 1 K past 4 K.
+- Prefill measured on the same runs: **350 tok/s** for a fresh ~4 K prompt;
+  224 tok/s for a ~19.6 K prompt that was 78 % prompt-cache hits.
 
-| # | Feature | What it does |
-|---|---|---|
-| 1 | **MTP experts on the CPU** (`--mtp-cpu-moe`) | The draft layer's 256 routed experts move to host RAM and run on the CPU; the CPU path skips CUDA graph capture. Draft layer **439 → 127 MiB** of VRAM — which is what lets `--max-context 81920` keep speculative decoding |
-| 2 | **DRY sampler** (`--dry-multiplier`) | llama.cpp's DRY as a pre-pass on the logits: a penalty that grows with the length of a **repeated sequence**, not with token frequency. Off by default (bit-exact); aimed at verbatim reasoning loops |
-| 3 | **Session autosave** | After each request the KV state is fingerprinted and SAVEd to disk, and RESTOREd on the way back. A 52 K-token conversation returns in **0.47 s** instead of 314 s of re-reading — a disk fallback for parked conversations |
-| 4 | **Log timestamps** | Every line from the engine and the driver carries `HH:MM:SS` (1,150 `fprintf` sites untouched — a pipe adds the stamps), so timing questions stop being guesswork |
-| 5 | **GUI launcher** | AutoHotkey v2: two views (pro / compact), parameter grid, model / GGUF / mmproj pickers, vision, chat-template file, run status, log tail, per-mode INI. Ships with `--selftest` |
-| 6 | **Driver and tools** | `strata-run.py` (one command per mode), `watch-loop.py` (two-source loop monitor), `ab-*.py` (warm-up + interleaved + median A/B benchmarks) |
+### Expert slots (this is what "it got slow" usually means)
 
-### 2.1 Measured performance
+Measured from the engine's own log line `expert cache N slots` at `--max-context 20480`:
 
-RTX 3050 Ti Laptop **4 GB** + i5-11400H + 32 GB, two parameter sets:
-
-| | short mode | long mode |
-|---|---|---|
-| `--max-context` | 20480 | **81920** |
-| KV | `k8v4`, fully resident | `k8v4`, fully resident |
-| MTP | on, experts **on the GPU** (`--spec 3`) *or* **on the CPU** (`--mtp-cpu-moe 1`, `--spec 2`) / off | on, experts **on the CPU** (`--mtp-cpu-moe 1`, `--spec 2`) |
-| `--vram-reserve-mib` | 64 | 64 |
-| `--expert-cache` | 800 | 800 |
-| largest context that starts | 39936 | **81920** |
-| **decode** | ~32–36 tok/s | **18.00 tok/s @79 K** (median of 3) |
-| **prefill** | ~250 tok/s | **153.8 tok/s @79 K** |
-
-Same 79 K prompt, same machine, against llama.cpp (b11382) running the same model family at `Q4_K_M`:
-
-| | TinyStrata (UD-IQ3_S, 3.46 bit/w) | llama.cpp (Q4_K_M, 5.19 bit/w) |
+| MTP experts in | slots | GiB of VRAM |
 |---|---:|---:|
-| prefill @79 K | **153.8 tok/s** | 103.3 tok/s |
-| decode @79 K | **18.00 tok/s** | 12.35 tok/s |
-| draft acceptance | 71–78 % | 65–78 % |
+| VRAM (`--mtp-cpu-moe 0`, default short mode) | **657** | 0.77 |
+| host RAM (`--mtp-cpu-moe 1`) | **915** | 1.07 |
 
-The ratio of the two speeds (1.46 decode, 1.49 prefill) tracks the ratio of the weight bytes
-(5.19 / 3.46 = 1.50) almost exactly: at this size decoding is a **bytes-moved** problem, so the
-smaller quant wins and the i-quant path costs nothing extra.
+At 1 K–20 K these two are **within ±5 % of each other** (43.1 vs 43.5, 40.0 vs 39.4,
+33.7 vs 34.9 tok/s), so the extra 258 slots do not buy decode speed — they buy
+head-room for a larger `--max-context`.
 
----
+If decode drops to single digits, the slots are gone: a leftover engine or another
+program holding the card is the usual cause. Check `nvidia-smi --query-gpu=memory.used`.
 
-## 3. Hardware and runtime
+### Other measured numbers
 
-### 3.1 The binaries in Releases only run here
-
-| | Requirement | Otherwise |
+| What | Value | How |
 |---|---|---|
-| **GPU arch** | **sm_86** (Ampere consumer/professional: RTX 3050/3060/3070/3080/3090, A10/A40, ...) | the release `strata.exe` is built for arch 86 only; other cards fail with a "no kernel image" error -> build it yourself (§5) |
-| **CUDA runtime** | `cudart64_12.dll` and `cublas64_12.dll` from **CUDA 12.x** must be on `PATH` | without them the engine does not start. Install CUDA Toolkit 12.x or point the config's `lib_dirs` at its `bin` |
-| **Driver** | CUDA 12.x capable (R525 or newer; measured 621.24) | same as above |
-| VRAM | **>= 4 GB** | the engine refuses to start, or `--max-context` is rejected |
-| RAM | **32 GB** (the experts live there, ~12 GiB) | the RAM guard kills the process |
-| OS | **Windows x64** | the only platform this repository was validated on |
+| Launcher preflight (all checks) | **1.2 s** | timed around `Preflight()` on a clean machine |
+| Engine start → HTTP ready | ~15 s | time from Start to `/props` answering |
+| VRAM ceiling for this model+card | 109,568 ctx | launcher's boundary line, from `serve/prepare.py` |
+| Suggested ctx (keeps ~400 slots) | 16,384 | same line, `ctx_suggested` |
+| Expert cache per slot | 1.229 MiB | 12.0 GiB experts ÷ 10,240 slots |
+| Launcher self-test | 180 checks, 0 fail | `TinyStrata-Launcher.exe --selftest` |
 
-> More VRAM is of course easier, but every number here comes from an **RTX 3050 Ti Laptop 4 GB + i5-11400H + 32 GB**.
+## 3. Requirements
 
-> **RAM is budgeted automatically**: before starting, the server sizes the parked-conversation pool from
-> `expert bytes + available RAM - 4 GiB` (a 35B-class model is capped at 1 GiB) and lowers the parking
-> admission floor to something this machine can satisfy. The `[prepare] budget:` lines say what it did.
+- **GPU**: compute capability 8.6 for the shipped binary (RTX 30-series). Other cards:
+  build it yourself (§5) with your `-arch=sm_XX`, the launcher will use it.
+- **CUDA 12.x runtime** (`cudart64_12.dll`, `cublas64_12.dll`); the config's `lib_dirs`
+  points at `…\CUDA\v12.8\bin`.
+- **RAM**: 16 GB minimum. 12.0 GiB is the expert set; below ~19 GB free the server
+  switches to low-RAM mode by itself and decode falls to ~1/3 (measured 11.8 tok/s).
+- **Windows 10/11 x64.** The portable bundle carries its own CPython 3.11.
 
-### 3.2 When you build it yourself
+## 4. Run it
 
-| | Note |
-|---|---|
-| CUDA | 12.8 (`build-strata-cuda12.bat`); other 12.x releases generally work |
-| GPU arch | `-DCMAKE_CUDA_ARCHITECTURES=86` (the default is 86; set your own for other cards, e.g. 89/120) |
-| Toolchain | Python 3.11 venv + `cmake` + `ninja` + MSVC (`vcvars64`); upstream's `START-HERE.bat` creates it |
-| Disk | model 15.3 GB + pack 65 MB + session files (52K tokens ~ 588 MB) |
+1. Unzip the portable bundle; double-click `TinyStrata-Launcher.exe`.
+2. **GGUF** → Browse… → your `Qwen3.6-35B-A3B-UD-IQ3_S.gguf`.
+3. Press **Start**. First start builds the pack the engine needs from the GGUF
+   (43.7 MiB zip; the 12 GiB of experts stay in the GGUF), which takes a few minutes;
+   later starts reuse it.
+4. The window shows the port; open `http://127.0.0.1:1339/` (or point any OpenAI-compatible
+   client at `http://127.0.0.1:1339/v1`).
 
-Model: `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, **UD-IQ3_S** (15.3 GB) or UD-IQ4_XS (18.2 GB);
-**the MTP layer must be inside the file** (`blk.40`). Before switching to another quant run the
-three-step check in [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md).
+The launcher writes nothing outside its own folder. `--pro` opens the two-column view,
+`--selftest` checks the install, `--preflight` prints what it would pass to the engine.
 
----
+## 5. What the patches change
 
-## 4. Quick start (download and run, no build)
+Ten patches against Strata 0.1.43, each with the measurement that motivated it:
 
-### 4.1 Download
+1. `--mtp-cpu-moe` — the draft layer's 256 routed experts move to the host CPU pool:
+   the MTP head drops from 439 MiB to 127 MiB of VRAM, which is what makes an 80 K
+   context start at all on 4 GB.
+2. DRY sampler — adds a repetition penalty that grows with the length of the match.
+   Measured cost is inside the run-to-run spread (±3 % on this machine), and it removes
+   the repeated-passage loops greedy sampling fell into before.
+3. `serve/setup` tools, session autosave, log timestamps.
+4. `serve` prepares the pack the engine needs (so a first start does not fail).
+5. `serve` honours `sampling.dry_*` from the config (it was silently ignored).
+6. `serve` fills the paths a template leaves as placeholders.
+7. `strata pack <gguf> -X <out>` — the engine writes the pack itself (no Python, no numpy);
+   its output is byte-identical to the Python packer (verified on IQ3_S).
+8. `serve` checks that `--mtp` is the model actually being run (a mismatched draft head
+   is the classic silent slowdown).
+9. `serve` budgets host allocations from the model and the machine (experts, parked
+   conversations, guard) instead of fixed numbers.
+10. `strata/ctl` — the launcher's middle layer: `mtp_mode → --mtp/--mtp-cpu-moe/--spec`,
+    the VRAM ceiling and suggested ctx from the capacity files, preflight warnings as
+    codes, and runtime numbers parsed from the logs. Plus: `--kv-resident 0` means
+    "all KV in VRAM" (the engine's default); the old code read 0 as "streaming".
 
-| File | Where |
-|---|---|
-| **`TinyStrata-0.1.0-portable.zip`** (53.7 MB) | **the short path**: unzip -> double-click `TinyStrata-Launcher.exe` -> pick the GGUF -> Start. Ships the engine, the launcher, `serve\` and an embedded Python 3.11 + numpy -- **no Python and no AutoHotkey install** |
-| `TinyStrata-Launcher.exe` (v0.1.0) | [Releases / v0.1.0](https://github.com/bizhonggeng/TinyStrata/releases/tag/v0.1.0) (538 KiB, **no AutoHotkey install needed**) |
-| `strata.exe` + `strata.exe.sha256` | same release (61.7 MiB, CUDA 12.8 / sm_86) |
-| `strata-launcher.ahk` (optional) | this repo, [launcher/](launcher/) (only if you want to change the UI) |
-| `strata-run.py` (optional) | this repo, [tools/](tools/), the CLI driver |
-| model GGUF | §7 |
+## 6. Limits (measured, not guessed)
 
-> **The launcher finds the engine itself**: it searches its own directory, four parent
-> directories and their subdirectories for `strata.exe` (including checkout layouts such as
-> `engine-cuda12\strata.exe`), then derives python / driver / config / log paths. Override it
-> with `STRATA_HOME` or pick a folder once from the menu (remembered in the ini).
-> The UI is bilingual, **follows the system language** by default, and the
-> 「语言 / Language」 menu switches it at any time.
+- **4 GB of VRAM is the constraint.** At `--max-context 20480` the expert cache gets
+  657 slots; asking for much more shrinks it (109,568 ctx is where the engine refuses
+  to start). The launcher prints the real ceiling and a suggestion that keeps ~400 slots.
+- **Compute capability is baked in.** A card that is not sm_86 reports "no kernel image";
+  build your own.
+- **Long context is not free**: 20 K is 22 % slower than 1 K (table above).
+- **The Windows binaries are unsigned.** The launcher is no longer UPX-packed (that
+  was causing a `Trojan:Win32/Wacatac.B!ml` false positive), but unsigned executables
+  can still be flagged; build from source if that matters.
 
-```powershell
-# verify (should print 9c6f5a0f...)
-Get-FileHash strata.exe -Algorithm SHA256
-Get-Content strata.exe.sha256
+## 7. Building it yourself
+
+```bat
+git clone https://github.com/Niko1221/Strata && cd Strata
+git checkout <the commit these patches are against>
+git am ..\TinyStrata\patches\*.patch
+:: build with upstream's script (CUDA 12.8, -arch=sm_86)
 ```
 
-### 4.2 Portable bundle (the "just make it run" path)
+Then point the launcher at your `strata.exe` (menu *About → Choose engine…*, remembered
+in `strata-launcher.ini`).
 
-`TinyStrata-0.1.0-portable.zip` unpacks to:
+## 8. Licence
 
-```
-TinyStrata\
-├── TinyStrata-Launcher.exe     launcher (compiled, no AutoHotkey needed)
-├── python\                     embedded CPython 3.11 + numpy / jinja2 / psutil / gguf
-├── strata\
-│   ├── engine-cuda12\strata.exe
-│   ├── serve\                  the OpenAI-compatible layer + web chat
-│   ├── tools\                  iq_pack.py / make_pack.py / gguf_reader.py ...
-│   └── data\                   expert profile + draft vocab
-├── tools\strata-run.py         the CLI driver the launcher spawns
-├── strata-qwen36-iq3s.json     template (keeps %placeholders%; the server fills them)
-├── configs\ docs\ README ...
-└── results\  sessions\         created at runtime; the pack goes to ..\packs\
-```
+Strata is MIT; this build keeps its `LICENSE`/`NOTICE.md`. The launcher and `strata/ctl`
+are MIT as well. Model weights are **not** included — download them from
+[unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF).
 
-**First run**: double-click `TinyStrata-Launcher.exe`, pick your GGUF under Model, press Start.
-Before the engine starts the server does this (visible as `[prepare]` lines):
-
-1. build the pack for that GGUF (3 s / 65 MB; the experts stay in the GGUF)
-2. repoint `--pack` and `tokenizer`
-3. fill the template's remaining placeholders -- `exe`, `cwd`, `--expert-profile`,
-   `--mtp-draft-vocab`, `--mtp` -- from the files shipped in the bundle
-4. drop the vision encoder when it is not there instead of failing
-
-Measured on the portable tree (embedded python, nothing installed): after naming one GGUF it
-printed `ready: http://127.0.0.1:13501/v1 (context 20480 tokens)`.
-
-`FIRST-RUN.txt` repeats this; logs land in `results\`.
-
-### 4.2.1 Put the files in place
-
-```powershell
-# <install> = wherever you put TinyStrata, e.g. C:\TinyStrata (used below)
-copy strata.exe              <install>\strata\engine-cuda12\strata.exe
-copy TinyStrata-Launcher.exe <install>\
-copy strata-run.py           <install>\tools\
-```
-
-The folder name is yours to pick: the launcher finds the engine by itself (§4.5) and the
-CLI driver knows its own location (`tools/strata-run.py` -> its parent is `<install>`).
-For a different layout, set `STRATA_HOME` / `STRATA_ROOT` (§5.3).
-
-### 4.3 The pack: what it is, and why a new model needs a new one
-
-The engine does not read a GGUF directly: it wants a "pack". A pack is **not a copy of the model**:
-
-```
-<packs>/qwen36-UD-IQ3_S/
-  dense.bin            53 MB   non-expert weights in the engine's layout
-  index.txt            52 KB   the index of 613 tensors
-  native_experts.txt    4 KB   * byte offsets of every layer's experts inside the GGUF
-  tokenizer\          9.7 MB
-  conversions.json / compat-bf16.json   quant conversion notes
-```
-
-The 12 GiB of routed experts stay in the GGUF and are read in place, which is why a pack takes
-**3 s / 65 MB** (measured on the 15.3 GB UD-IQ3_S file). Three ways to get one:
-
-**A. Use the prebuilt pack from Releases (no dependencies)**
-
-`Releases -> pack-qwen36-UD-IQ3_S.zip` (43.7 MB) matches `UD-IQ3_S`. Unzip it into the **parent**
-of the template's `--pack` (default `<install>\packs\`), so you end up with
-`<install>\packs\qwen36-UD-IQ3_S\dense.bin ...`.
-
-**B. Do nothing (the path for "I only downloaded a GGUF")**
-
-The launcher only passes the model path. The **server prepares the pack before the engine starts**
-(`serve/prepare.py`, ~3 s): when `--pack` is missing or names a different GGUF it builds one from
-the GGUF's name, repoints `--pack` and `tokenizer`, and only then loads the model:
-
-```
-[prepare] this GGUF has no matching pack: Qwen3.6-35B-A3B-UD-IQ3_S.gguf
-[prepare]   -> <install>\packs\qwen36-ud-iq3_s (about 3 s, the experts stay in the GGUF)
-[prepare] pack ready: <install>\packs\qwen36-ud-iq3_s
-```
-
-The launcher just shows "a pack will be prepared at start (~3 s)" -- it runs no python and writes
-no files.
-
-**C. Command line**
-
-```powershell
-# the engine writes it (no Python, no numpy, no GPU)
-<install>\strata\engine-cuda12\strata.exe pack --gguf <your.gguf> --out <install>\packs\qwen36-UD-IQ3_S
-
-# only a file whose small projections are quantized falls back to the Python packer
-python tools\make_pack.py --gguf <your.gguf> --packs <install>\packs
-```
-> The server does the same: it calls the engine's `pack` subcommand first and only falls back to
-> the Python packer; the tokenizer is added by the server.
-
-
-> **A different quant needs a different pack.** `native_experts.txt` records which GGUF file it
-> points into; pairing the IQ3_S pack with an IQ4_XS model reads garbage without an error. The
-> launcher now compares the two names before starting and refuses when they differ.
-
-(`setup.py --family qwen36 --model UD-IQ3_S` is the full-wizard route: it downloads the model,
-builds the pack, picks the MTP layer and writes a config -- convenient from zero, slower than A/B/C
-when the only thing missing is the pack.)
-
-### 4.4 Configure the template
-
-Copy `configs/strata-qwen36-iq3s.example.json` to `<install>\strata-qwen36-iq3s.json`.
-The template uses **environment-variable placeholders** (`%STRATA_ROOT%` / `%STRATA_PACKS%` /
-`%STRATA_MODELS%` ...): either set them (see `configs/README.md`) or edit the paths in place.
-
-### 4.5 Start a mode
-
-**A: GUI** — double-click `TinyStrata-Launcher.exe` (or the `.ahk`), pick long/short, press Start.
-It locates the engine by itself, so no path editing. The simple view already has a **Model** group
-with GGUF / mmproj `Browse...` buttons, so you can point it at the model you just downloaded
-without switching to the pro view. **Vision follows the mmproj**: with none selected the vision
-box is `off` and greyed out (no error); picking an mmproj switches it to `cpu` (no VRAM), and you
-can still choose `gpu` / `off` afterwards. The UI follows the system language and the
-「Language」 and 「About」 menus (About has clickable project / upstream / model links and
-prints the paths the launcher resolved). Launcher self-checks: `TinyStrata-Launcher.exe --selftest` /
-`--i18ntest` / `--findtest` (reports land next to the engine).
-**The engine is swappable**: point it at your own build with `STRATA_EXE` or
-"About -> Choose engine..." (see §5.4).
-
-**B: command line**
-
-```bash
-# long mode (80 K, MTP experts on the CPU) — the mode this repository is about
-python tools/strata-run.py --tag long --ctx 81920 --kv k8v4 --vram-reserve-mib 64 \
-    --mtp on --mtp-cpu-moe on --spec 2 --thinking on --preserve-thinking on
-
-# short mode (20 K, MTP experts on the GPU)
-python tools/strata-run.py --ctx 20480 --kv k8v4 --vram-reserve-mib 64 --mtp on --spec 3
-```
-
-### 4.6 Check the two flags that matter
-
-```powershell
-<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"mtp-cpu-moe"
-<install>\strata\engine-cuda12\strata.exe --help | findstr /C:"dry-multiplier"
-```
-
-Both lines must appear. A binary built from upstream **without** these patches prints nothing.
-
----
-
-## 5. Install (build or modify it yourself)
-
-### 5.1 Build
-
-```bash
-# 1. upstream, at the commit these patches are written against
-git clone https://github.com/Niko1221/Strata
-cd Strata && git checkout cd1daa4e          # "Merge upstream/main (0.1.43) into qwen36-35b-support"
-
-# 2. the patches
-git am /path/to/TinyStrata/patches/*.patch
-
-# 3. build the engine (upstream's own script; CUDA 12.8, sm_86)
-cmd /c build-strata-cuda12.bat
-cp build-cuda12/strata.exe engine-cuda12/strata.exe
-
-# 4. one-time: build the pack from the GGUF
-python setup.py --family qwen36 --model UD-IQ3_S
-```
-
-> **Deployment trap you must know**: `cmake --build` writes only `build-cuda12/strata.exe`, while
-> the runtime reads `engine-cuda12/strata.exe` — **without the `cp` nothing changed**.
-
-### 5.2 Changing the code
-
-Every change is small and commented: `src/core/mtp.cpp` (expert offload),
-`sampler.hpp` / `sampler.cu` (the DRY kernel), `src/program/generate.cpp` (flags),
-`serve/` (autosave, log timestamps). Re-export the patches with:
-
-```bash
-cd <install>/strata
-git format-patch -q cd1daa4e..HEAD -o /path/to/TinyStrata/patches --no-signature
-```
-
-### 5.3 Layout
-
-Default layout (pick any folder name; `<install>` is where the launcher and the driver live):
-
-```
-<install>\
-├── strata\                     upstream checkout, engine in strata\engine-cuda12\strata.exe
-├── tools\strata-run.py         the driver (its parent is <install>)
-├── configs\strata-qwen36-iq3s.example.json   copy to strata-qwen36-iq3s.json
-├── results\                    logs land here
-└── sessions\                   autosave .sess files (set "slot_save_path")
-
-<models>\Qwen3.6-35B-A3B-MTP-GGUF\           the GGUF (+ mmproj-F32.gguf for images)
-<packs>\qwen36-UD-IQ3_S\                    the pack setup.py builds
-```
-
-This layout is a **default, not a hard-coded path**. Three ways to move things:
-
-| Knob | What it does |
-|---|---|
-| env `STRATA_HOME` | the whole `<install>` root (config, logs, sessions follow) |
-| env `STRATA_ROOT` | the upstream checkout only (default `<install>\strata`) |
-| launcher menu "About -> Open engine folder" / the "Browse..." prompt | pick once, remembered in `strata-launcher.ini` |
-
-`<models>` / `<packs>` live in the config template as `%STRATA_MODELS%` / `%STRATA_PACKS%`
-placeholders (see `configs/README.md`).
-
-### 5.4 Other NVIDIA cards (e.g. the 20 series): build it, the launcher still works
-
-The released engine is built for **sm_86** only. To run on anything else (20 series sm_75,
-40 series sm_89, 50 series sm_120 ...), build your own -- **the launcher and the engine are
-modular**: the launcher is UI + arguments, the engine is a pluggable binary.
-
-```bash
-# 1) build for your compute capability
-#    RTX 20xx = 75   RTX 30xx = 86   RTX 40xx = 89   RTX 50xx = 120
-cmake -S . -B build-mine -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DSTRATA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
-cmake --build build-mine --target strata -j 6
-mkdir -p engine-mine && cp build-mine/strata.exe engine-mine/strata.exe
-
-# 2) point the launcher at it (either way)
-set STRATA_EXE=<your dir>\engine-mine\strata.exe
-# or: menu "About -> Choose engine..." once; it is remembered in strata-launcher.ini
-```
-
-| | |
-|---|---|
-| Which arch | the launcher's About shows the detected `compute_cap` and the exact `-DCMAKE_CUDA_ARCHITECTURES=` value to use (8.6 -> 86, 7.5 -> 75) |
-| Engine file name | anything ending in `.exe` (`strata-sm75.exe` is fine) |
-| CUDA version | any 12.x (the release uses 12.8); just change the path in `build-strata-cuda12.bat` |
-| After swapping the engine | arguments, pack and session cache keep working -- none of it depends on the engine build |
-| Arch mismatch | the launcher only *warns* before starting (your card is X, build with Y), it never blocks |
-
-> Why not ship several architectures? One arch's kernel tables are tens of MB; three or four of
-> them would double the download. A one-off `cmake --build` is cheaper than shipping all of them.
----
-
-## 6. Upstream and what the patches change
-
-**TinyStrata is a derivative work of [Strata](https://github.com/Niko1221/Strata)** (MIT,
-Copyright (c) 2026 Niko1221 and the Strata contributors). `LICENSE` is upstream's, unchanged;
-see [`NOTICE.md`](NOTICE.md) for the exact baseline and the disclaimer.
-
-| | |
-|---|---|
-| Upstream | <https://github.com/Niko1221/Strata> |
-| Baseline of these patches | `cd1daa4e` — "Merge upstream/main (0.1.43) into qwen36-35b-support" |
-| Branch the baseline came from | `aflin/Strata`, `qwen36-35b-support` (PR #1402: Qwen3.6-35B-A3B support) |
-
-### 6.1 The three patches
-
-| Patch | Touches | Effect (measured on 4 GB) |
-|---|---|---|
-| [`0001-mtp-mtp-cpu-moe`](patches/0001-mtp-mtp-cpu-moe-the-draft-layer-s-256-experts-on-the.patch) | `src/core/mtp.cpp`, `src/program/generate.cpp`: adds `--mtp-cpu-moe` — draft experts on the CPU, graph capture skipped | draft layer **439 → 127 MiB**; decode 24.7 tok/s @65 K (87 % accepted), 18.6–21.5 tok/s @80 K |
-| [`0002-sampler-DRY`](patches/0002-sampler-DRY-a-penalty-that-grows-with-the-length-of-.patch) | `sampler.hpp` / `sampler.cu` / `generate.cpp`: DRY pre-pass kernel + four `--dry-*` flags, covering greedy / sampled / split-merge | coding prompt: off = 2,529 tokens of thinking and **not one token of answer**; `--dry-multiplier 1.5` = 1,737 tokens + the correct function |
-| [`0003-serve-setup-tools`](patches/0003-serve-setup-tools-session-autosave-log-timestamps-ch.patch) | `serve/autosave.py` (new), `serve/server.py`, `setup.py`, `tools/strata_inspect.py`: session autosave, log timestamps, `--chat-template-file`, wider quant list | 52 K-token restore in **0.47 s** (vs 314 s); save 380 ms / restore 143 ms; `--expert-cache 800` makes prefill 27–45 % faster |
-
-The patches are authored as `strata-4gb <strata-4gb@localhost>`; after applying, run
-`git commit --amend --reset-author` to put your own name on them.
-
----
-
-## 7. Supported models
-
-| Model | Quant | Size | Note |
-|---|---|---|---|
-| [**unsloth/Qwen3.6-35B-A3B-MTP-GGUF**](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | **UD-IQ3_S** | 15.3 GB | **Every number in this repo comes from it.** Recommended |
-| same | UD-IQ4_XS | 18.2 GB | Fits 4 GB too; slightly slower prefill, slightly better quality |
-| same | `mmproj-F32.gguf` | — | Only needed for image input (vision) |
-
-- In China, swap the host for `hf-mirror.com` (`HF_ENDPOINT=https://hf-mirror.com`).
-- **The MTP layer must be inside the GGUF** (`blk.40`). Before downloading another quant or another
-  uploader, run the three-step check in
-  [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md): `qwen35moe` +
-  `block_count 41` + an MTP-named file / `strata_inspect.py` printing `with an MTP layer`.
-- **Parameters on a 4 GB card**: `UD-IQ3_S` runs in short mode (MTP experts in VRAM); **a larger quant such as
-  `UD-IQ4_XS` needs the MTP experts on the CPU** (pick `cpu` in the launcher's mtp field, or `--mtp-cpu-moe 1`):
-  the dense weights are bigger, so the draft layer's 439 MiB leaves prefill without scratch buffers
-  (`prefill ... out of memory`). Measured: IQ4_XS + `--mtp-cpu-moe` + ctx 20480 is ready in 21 s with vision on.
-- **`--spec` does not save VRAM**: the verify window is allocated for `kVerifyMaxT = 8` up front (the expert
-  cache arithmetic in `generate.cpp` uses `kVerifyMaxT`, not `--spec`); it only decides how many drafts are
-  proposed per round -> acceptance and speed. The suffix drafter is on by default and adds 2 at startup
-  (capped at 8), so `--spec 2` actually runs 4.
-- **Matching pack**: `UD-IQ3_S` uses `pack-qwen36-UD-IQ3_S.zip` from Releases (43.7 MB);
-  any other quant: `tools/make_pack.py` builds one in 3 s / 65 MB -- see §4.3.
-- Model licence: this Unsloth GGUF is Apache-2.0. Weights are not part of this repository.
-
----
-
-## 8. Documentation
-
-| Document | Contents |
-|---|---|
-| [`docs/4GB-TUNING.md`](docs/4GB-TUNING.md) | The full 4 GB tuning log: why each parameter has its value, the measurement protocol (warm-up → interleaved → median of 3) and the noise floor (instance-to-instance ±6 %) |
-| [`docs/GGUF-SELECTION-STANDARD.md`](docs/GGUF-SELECTION-STANDARD.md) | Hard requirements for picking a GGUF, red flags, the three-step filter |
-| [`launcher/strata-launcher.ahk`](launcher/strata-launcher.ahk) | The GUI launcher (AHK v2, ships `--selftest` / `--guismoke` / `--switchtest`) |
-| [`tools/strata-run.py`](tools/strata-run.py) | Mode driver: one command per mode, boundary checks, logs |
-| [`tools/watch-loop.py`](tools/watch-loop.py) | Two-source loop monitor: engine log (`LOOP-RECOVERY` / `DEGEN-TOKEN` / `THINK-ONLY`) and the client's session file (repeated tool calls, verbatim repeated reasoning) |
-| [`tools/ab-modes.py`](tools/ab-modes.py) · [`tools/ab-prefill-fast.py`](tools/ab-prefill-fast.py) | A/B benchmarks: warm-up + interleaved + median of 3; prefill from the progress line in 45 s |
-
----
-
-## 9. Everything else
-
-### 9.1 Limits (read this before filing anything)
-
-- **Decode falls with context**: 25 tok/s at 30 K, 18 at 79 K on this card.
-- **Client-side compaction is a hard boundary** for prefix reuse: a compacted conversation re-reads
-  its whole prompt once (~2 min at 37 K tokens here). Every engine that matches token prefixes has
-  this.
-- **Tool-call loops are a harness problem, not a sampler problem.** A model that repeats the same
-  `read` call 77 times is not fixed by temperature, DRY or a quant change — it needs a guard in the
-  client (`tools/watch-loop.py` detects both kinds).
-- **K-quants are not free here**: `Q4_K*`/`Q5_K*`/`Q6_K` need a build with
-  `-DSTRATA_MMQ_KQUANTS=ON` for the prompt path, and every added kernel instance is loaded eagerly,
-  costing VRAM for *every* model on a 4 GB card. `Q2_K`/`Q3_K` are not covered by that option at all.
-- **Single GPU, single request.** `--batch`, layer splits and peer devices do not combine with
-  these patches (the session files refuse them too).
-
-### 9.2 Licence
-
-**MIT**, as upstream. `LICENSE` is upstream's text; `patches/` are our changes to MIT code and are
-MIT as well. Model weights are not part of this repository and keep their own licence (Apache-2.0).
-
-This project is not affiliated with or endorsed by the Strata authors.
-
-### 9.3 Reporting
-
-When opening an issue, include: the full `strata-run.py` command line, the
-`--max-context` / KV / MTP settings, and the tail of the matching log in `results/`
-(the timestamps let us align things directly).
+中文说明见 [README.zh-CN.md](README.zh-CN.md)。

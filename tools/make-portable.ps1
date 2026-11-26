@@ -27,6 +27,15 @@ Write-Host "[--] serve/ (with the web UI: web/, chat_template.jinja, ...)"
 Copy-Item -Recurse "$checkout\serve\*" "$root\strata\serve\" -Exclude "__pycache__", "test_*.py"
 Get-ChildItem "$root\strata\serve" -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 
+Write-Host "[--] middle layer (strata/ctl + strata-ctl.py)"
+# 启动器要调 `strata-ctl.py plan/observe`（参数归一化、边界/建议值、预检提醒、运行时观测都在里面）。
+# 包标记 __init__.py 也要带上，否则 import strata.ctl 找不到包。
+Copy-Item -Recurse "$checkout\ctl" "$root\strata\ctl"
+Get-ChildItem "$root\strata\ctl" -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+Get-ChildItem "$root\strata\ctl	ests" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+if (Test-Path "$checkout\__init__.py") { Copy-Item "$checkout\__init__.py" "$root\strata\__init__.py" }
+if (Test-Path "$checkout\..\strata-ctl.py") { Copy-Item "$checkout\..\strata-ctl.py" "$root\strata-ctl.py" }
+
 Write-Host "[--] tools/ (only what the server and the pack builder need)"
 foreach ($f in @("iq_pack.py", "make_pack.py", "gguf_reader.py", "strata_tokenizer.py", "pack_index.py", "strata_inspect.py")) {
     $src = Join-Path "$checkout\tools" $f
